@@ -17,6 +17,8 @@ setup(
         "tqdm",
         "types-tqdm",
         "tabulate",
+        "datasets",
+        "transformers",
     ],
     extras_require={
         "torch": [
