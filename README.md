@@ -26,6 +26,7 @@ BooksCorpus
 English Wikipedia
 * A cleaned-up version of English Wikipedia articles, consisting of about 2.5 billion words. Only the text content was used (lists, tables, and headers were excluded).
 * Huggingface dataset https://huggingface.co/datasets/wikimedia/wikipedia. 
+* https://huggingface.co/datasets/legacy-datasets/wikipedia
 
 The following are the number of words I found to exist in either dataset
 ```
@@ -87,6 +88,11 @@ Tokenization steps
 * BERT tokenizer baed on WordPiece
 [BertTokenizerFast](https://huggingface.co/docs/transformers/en/model_doc/bert#transformers.BertTokenizerFast)
 * "fast" BERT tokenizer based on WordPiece
+
+Input Formatting
+* padding is required to make the input tensors have rectangular shape
+* attention masks {0,1} - indicate the tokens that should be attended to or ignored by the attention layers of the model.
+* most models can only handle sequences of 512 to 1024 tokens
 
 
 # Masking
