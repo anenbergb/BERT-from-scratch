@@ -10,12 +10,13 @@ Tokenizer
 # References
 * BERT paper https://arxiv.org/abs/1810.04805
 * Blog post https://jalammar.github.io/illustrated-bert/
+* Google Research BERT implementation https://github.com/google-research/bert
+
 
 * https://www.philschmid.de/pre-training-bert-habana
 * Huggingface BERT model https://huggingface.co/google-bert/bert-base-uncased
 * Huggingface https://huggingface.co/docs/transformers/model_doc/bert
-
-
+* Huggingface language model training examples https://github.com/huggingface/transformers/tree/main/examples/pytorch/language-modeling
 
 
 # Dataset
@@ -86,6 +87,7 @@ Tokenization steps
 ## Huggingface Tokenizer
 [BertTokenizer](https://huggingface.co/docs/transformers/en/model_doc/bert#transformers.BertTokenizer)
 * BERT tokenizer baed on WordPiece
+* github implementation https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/bert/tokenization_bert.py
 [BertTokenizerFast](https://huggingface.co/docs/transformers/en/model_doc/bert#transformers.BertTokenizerFast)
 * "fast" BERT tokenizer based on WordPiece
 
