@@ -2,6 +2,7 @@ from dataclasses import dataclass, field
 import torch
 from torch import nn
 import math
+from typing import Optional
 
 
 @dataclass
@@ -39,6 +40,15 @@ class BertConfig:
         initializer_range: float
             The standard deviation of the truncated_normal_initializer for
             initializing all weight matrices.
+
+        pre_layer_norm: bool
+            Whether to use post layer norm or pre layer norm.
+            pre-LN: Layer normalization is applied to the input of the attention block and ffn block, but not to the residual connection.
+            post-LN: Layer normalization is applied after the residual connection.
+
+            post-LN is the default in BERT, but pre-LN may improve training stability
+            in deep transformer models due to gradient amplification.
+            https://arxiv.org/abs/2002.04745
     """
 
     vocab_size: int = 30522
@@ -54,26 +64,42 @@ class BertConfig:
     layer_norm_eps: float = 1e-12
     position_embedding_type: str = "absolute"
     pad_token_id: int = 0
+    pre_layer_norm: bool = False
 
 
 class BertEmbeddings(nn.Module):
     """
     Construct the embeddings from word, position, and token_type embeddings.
 
+    The default BERT model uses post-LN configuration, where LayerNorm is applied after the residual connection.
+    When pre-LN is used, LayerNorm is applied to the input of the attention block and ffn block, but not to the residual connection.
+    Because LayerNorm is applied at the input of the attention block, the embedding LayerNorm is redundant.
+    The Transformer's first LayerNorm can handle scaling and stabilization directly from the combined embeddings (post-Dropout).
+
     Args:
         config: BertConfig
             Configuration for the BERT model.
     """
 
-    def __init__(self, config):
+    def __init__(self, config: BertConfig):
         super().__init__()
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
-        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
+        self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id)
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(self, input_ids, token_type_ids):
+        self.pre_layer_norm = getattr(config, "pre_layer_norm", False)
+        if not self.pre_layer_norm:
+            self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.position_embedding_type = getattr(config, "position_embedding_type", "absolute")
+        # https://pytorch.org/docs/stable/generated/torch.nn.Module.html#torch.nn.Module.register_buffer
+        self.register_buffer(
+            "position_ids",
+            torch.arange(config.max_position_embeddings, dtype=torch.long).expand((1, -1)),
+            persistent=False,
+        )
+
+    def forward(self, input_ids: torch.LongTensor, token_type_ids: Optional[torch.LongTensor] = None) -> torch.Tensor:
         """
         Forward pass for the embeddings.
 
@@ -87,14 +113,23 @@ class BertEmbeddings(nn.Module):
             torch.Tensor: Combined embeddings.
         """
         T = input_ids.size(1)
-        pos = torch.arange(0, T, dtype=torch.long, device=input_ids.device)
-        pos_emb = self.position_embeddings(pos)  # (T, 768)
+
+        position_ids = self.position_ids[:, :T]
+        if token_type_ids is None:
+            token_type_ids = torch.zeros(T, dtype=torch.long, device=self.position_ids.device)
+
         word_emb = self.word_embeddings(input_ids)  # (B,T,768)
         tok_type_emb = self.token_type_embeddings(token_type_ids)  # (B,T,768)
-        x = pos_emb + word_emb + tok_type_emb
+        x = word_emb + tok_type_emb
+
+        if self.position_embedding_type == "absolute":
+            position_emb = self.position_embeddings(position_ids)
+            x += position_emb
 
         # LayerNorm stabilizes the combined embeddings by ensuring zero mean and unit variance
-        x = self.norm(x)
+        if not self.pre_layer_norm:
+            x = self.norm(x)
+
         # Regularizes the embeddings before they enter the Transformer stack,
         # preventing overfitting to specific embedding patterns.
         x = self.dropout(x)
@@ -110,10 +145,9 @@ class ScaledDotProductAttention(nn.Module):
             Configuration for the BERT model.
     """
 
-    def __init__(self, config):
+    def __init__(self, config: BertConfig):
         super().__init__()
         assert config.hidden_size % config.num_attention_heads == 0
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
 
         # heads are parallel streams, and outputs get concatenated.
         # key, query, value projections for all heads, but in a batch
@@ -122,10 +156,12 @@ class ScaledDotProductAttention(nn.Module):
         self.c_proj = nn.Linear(config.hidden_size, config.hidden_size)
         self.dropout_attn = nn.Dropout(config.attention_probs_dropout_prob)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        self.n_head = config.num_attention_heads
-        self.hidden_size = config.hidden_size
 
-    def forward(self, x):
+        self.hidden_size = config.hidden_size  # 768
+        self.n_head = config.num_attention_heads  # 12
+        self.head_size = config.hidden_size // config.num_attention_heads  # 64
+
+    def forward(self, x: torch.Tensor, attention_mask: torch.LongTensor) -> torch.Tensor:
         """
         Forward pass for the attention mechanism.
 
@@ -137,7 +173,6 @@ class ScaledDotProductAttention(nn.Module):
             torch.Tensor: Output tensor after applying attention.
         """
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
-        x = self.norm(x)
 
         # calculate query, key, value for all heads in batch
         # C is hidden_size, which is 768 in BERT
@@ -154,9 +189,14 @@ class ScaledDotProductAttention(nn.Module):
         # attention multiplies the head_size dimension (T,64) x (64,T) = (T,T)
         # (B, nh, T, 64) x (B, nh, 64, T) -> (B, nh, T, T)
         att = q @ k.transpose(2, 3)
-        # scale q, k, v by 1/sqrt(64), the head size
-        scale = 1.0 / math.sqrt(k.size(-1))
-        att = att * scale
+        att = att / math.sqrt(self.head_size)
+
+        # attention mask is a binary mask of shape (B,T) that is 1 for positions we want to attend to
+        attention_mask = attention_mask.unsqueeze(1).unsqueeze(2)  # (B, 1, 1, T)
+        # Broadcast to (B, nh, T, T) by applying it to the key dimension
+        # Mask out padding by setting scores to -inf where attn_mask is 0
+        attn = attn.masked_fill(attention_mask == 0, float("-inf"))  # (B, nh, T, T)
+
         # att describes the relation between the tokens in the sequence
         # how much token 0 should be a mixture of tokens 0 through T
         att = nn.functional.softmax(att, dim=-1)
@@ -190,9 +230,9 @@ class BertFFN(nn.Module):
         super().__init__()
         self.scale_factor = 4
         self.layers = nn.Sequential(
-            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
             nn.Linear(config.hidden_size, config.hidden_size * self.scale_factor),
-            nn.GELU(),  # approximate tanh?
+            # approximate GELU with tanh is sufficient for BERT
+            nn.GELU(approximate="tanh"),
             nn.Dropout(config.hidden_dropout_prob),
             nn.Linear(config.hidden_size * self.scale_factor, config.hidden_size),
             nn.Dropout(config.hidden_dropout_prob),
@@ -223,15 +263,23 @@ class BertBlock(nn.Module):
 
     def __init__(self, config):
         """
-        Pre-LN helps stabilize training.
+        BERT uses post-LN where layer normalization
+        is applied after the residual connection,
+        as opposed to pre-LN where layer normalization is applied
+        to the input of the attention block and ffn block, but not to the
+        residual connection.
         """
         super().__init__()
         self.attention = ScaledDotProductAttention(config)
         self.ffn = BertFFN(config)
+        self.ln1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.ln2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+        self.pre_layer_norm = getattr(config, "pre_layer_norm", False)
 
     def forward(self, x):
         """
         Forward pass for the BERT block.
+        This
 
         Args:
             x: torch.Tensor
@@ -240,6 +288,13 @@ class BertBlock(nn.Module):
         Returns:
             torch.Tensor: Output tensor after applying attention and feed-forward layers.
         """
-        x += self.attention(x)
-        x += self.ffn(x)
+        if self.pre_layer_norm:
+            x += self.attention(self.ln1(x))
+        else:
+            x = self.ln1(x + self.attention(x))
+
+        if self.pre_layer_norm:
+            x += self.ffn(self.ln2(x))
+        else:
+            x = self.ln2(x + self.ffn(x))
         return x

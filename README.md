@@ -119,7 +119,10 @@ Dropout: 0.1 on all layers.
 Weight Decay: 0.01.
 Loss: Masked Language Model (MLM) + Next Sentence Prediction (NSP), with 15% of tokens masked for MLM.
 ```
-* coudl try reducing max steps to 100k
+* could try reducing max steps to 100k
+
+As described in "On Layer Normalization in the Transformer Architecture" by Xiong et al. (2020), available at https://arxiv.org/abs/2002.04745, it isn't necessary to use the warm-up stage if Pre-LayerNormalization is applied. Just linearly decay the learning rate from 3e-4 (rather than 1e-4). Using such a high learning rate for post-LN BERT would lead to optimization divergence.
+
 
 
 ## Fine-Tuning
