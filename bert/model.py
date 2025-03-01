@@ -3,6 +3,7 @@ import torch
 from torch import nn
 import math
 
+
 @dataclass
 class BertConfig:
     """
@@ -39,6 +40,7 @@ class BertConfig:
             The standard deviation of the truncated_normal_initializer for
             initializing all weight matrices.
     """
+
     vocab_size: int = 30522
     hidden_size: int = 768
     num_hidden_layers: int = 12
@@ -51,7 +53,7 @@ class BertConfig:
     initializer_range: float = 0.02
     layer_norm_eps: float = 1e-12
     position_embedding_type: str = "absolute"
-    pad_token_id: int = 0    
+    pad_token_id: int = 0
 
 
 class BertEmbeddings(nn.Module):
@@ -65,6 +67,7 @@ class BertEmbeddings(nn.Module):
         self.token_type_embeddings = nn.Embedding(config.type_vocab_size, config.hidden_size)
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
+
     def forward(
         self,
         input_ids,
@@ -74,46 +77,51 @@ class BertEmbeddings(nn.Module):
         input_ids is shape (B, T) where T is either 128 or 512
         """
         T = input_ids.size(1)
-        pos = torch.arange(0, T, dtype=torch.long, device = input_ids.device)
-        pos_emb = self.position_embeddings(pos) # (T, 768)
-        word_emb = self.word_embeddings(input_ids) # (B,T,768)
-        tok_type_emb = self.token_type_embeddings(token_type_ids) # (B,T,768)
+        pos = torch.arange(0, T, dtype=torch.long, device=input_ids.device)
+        pos_emb = self.position_embeddings(pos)  # (T, 768)
+        word_emb = self.word_embeddings(input_ids)  # (B,T,768)
+        tok_type_emb = self.token_type_embeddings(token_type_ids)  # (B,T,768)
         x = pos_emb + word_emb + tok_type_emb
+
+        # LayerNorm stabilizes the combined embeddings by ensuring zero mean and unit variance
         x = self.norm(x)
+        # Regularizes the embeddings before they enter the Transformer stack,
+        # preventing overfitting to specific embedding patterns.
         x = self.dropout(x)
         return x
-    
+
 
 class ScaledDotProductAttention(nn.Module):
     def __init__(self, config):
         super().__init__()
         assert config.hidden_size % config.num_attention_heads == 0
+        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
+
         # heads are parallel streams, and outputs get concatenated.
         # key, query, value projections for all heads, but in a batch
         self.c_attn = nn.Linear(config.hidden_size, config.hidden_size * 3)
         # output projection
         self.c_proj = nn.Linear(config.hidden_size, config.hidden_size)
-        self.dropout = nn.Dropout(config.attention_probs_dropout_prob)
-        self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-
+        self.dropout_attn = nn.Dropout(config.attention_probs_dropout_prob)
+        self.dropout = nn.Dropout(config.hidden_dropout_prob)
         self.n_head = config.num_attention_heads
         self.hidden_size = config.hidden_size
 
     def forward(self, x):
-        B, T, C = x.size() # batch size, sequence length, embedding dimensionality
-        
+        B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
+        x = self.norm(x)
+
         # calculate query, key, value for all heads in batch
         # C is hidden_size, which is 768 in BERT
         # nh is "number of heads", which is 12 in BERT
         # hs is "head size", which is C // nh = 768 // 12 = 64 in BERT
-    
-        qkv = self.c_attn(x) # (B, T, 3*C)
-        q, k, v = qkv.split(self.hidden_size, dim=2) # (B, T, C) x 3
+
+        qkv = self.c_attn(x)  # (B, T, 3*C)
+        q, k, v = qkv.split(self.hidden_size, dim=2)  # (B, T, C) x 3
         # (B, T, C) -> (B, T, nh, C/nh) = (B, T, nh, 64) --transpose(1,2)--> (B, nh, T, 64)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, 64)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, 64)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, 64)
-        
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 64)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 64)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, 64)
 
         # attention multiplies the head_size dimension (T,64) x (64,T) = (T,T)
         # (B, nh, T, 64) x (B, nh, 64, T) -> (B, nh, T, T)
@@ -127,41 +135,47 @@ class ScaledDotProductAttention(nn.Module):
         # Randomly sets some attention weights to zero during training,
         # meaning certain key-value pairs are ignored for that forward pass.
         # This prevents the model from over-relying on specific attention patterns.
-        att = self.dropout(att)
+        att = self.dropout_attn(att)
 
         # re-mix the value tokens, by multiplying each token by the corresponding
         # weights in the attention matrix. Do this across all 64 dimensions
-        y = att @ v # (B, nh, T, T) x (B, nh, T, 64) -> (B, nh, T, 64)
-        
+        y = att @ v  # (B, nh, T, T) x (B, nh, T, 64) -> (B, nh, T, 64)
+
         # (B, nh, T, 64) -> (B, T, nh, 64) -> (B, T, nh*64 = 12*64 = 768)
         y = y.transpose(1, 2).contiguous().view(B, T, C)
         # output projection
         y = self.c_proj(y)
-        # y = self.norm(y)
+        y = self.dropout(y)
         return y
-    
+
+
+class BertFFN(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.scale_factor = 4
+        self.layers = nn.Sequential(
+            nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
+            nn.Linear(config.hidden_size, config.hidden_size * self.scale_factor),
+            nn.GELU(),  # apprixmiate tanh?
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(config.hidden_size * self.scale_factor, config.hidden_size),
+            nn.Dropout(config.hidden_dropout_prob),
+        )
+
+    def forward(self, x):
+        return self.layers(x)
+
+
 class BertBlock(nn.Module):
     def __init__(self, config):
         """
         Pre-LN helps stabilize training
         """
         super().__init__()
-        self.scale_factor = 4
         self.attention = ScaledDotProductAttention(config)
-        self.norm1 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.mlp = nn.Sequential(
-            nn.Linear(config.hidden_size, config.hidden_size * self.scale_factor),
-            nn.GELU(), # apprixmiate tanh?
-            nn.Linear(config.hidden_size * self.scale_factor, config.hidden_size),
-        )
-        self.norm2 = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
-        self.dropout = nn.Dropout(config.hidden_dropout_prob)
+        self.ffn = BertFFN(config)
+
     def forward(self, x):
-        x = x + 
-        h = self.attention(x)
-        h = self.dropout(h)
-        x = self.norm1(x + h)
-        h = self.mlp(x)
-        h = self.dropout(h)
-        x = self.norm2(x + h)
+        x += self.attention(x)
+        x += self.ffn(x)
         return x
