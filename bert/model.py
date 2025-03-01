@@ -57,10 +57,15 @@ class BertConfig:
 
 
 class BertEmbeddings(nn.Module):
-    def __init__(
-        self,
-        config,
-    ):
+    """
+    Construct the embeddings from word, position, and token_type embeddings.
+
+    Args:
+        config: BertConfig
+            Configuration for the BERT model.
+    """
+
+    def __init__(self, config):
         super().__init__()
         self.position_embeddings = nn.Embedding(config.max_position_embeddings, config.hidden_size)
         self.word_embeddings = nn.Embedding(config.vocab_size, config.hidden_size, padding_idx=0)
@@ -68,13 +73,18 @@ class BertEmbeddings(nn.Module):
         self.norm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
 
-    def forward(
-        self,
-        input_ids,
-        token_type_ids,
-    ):
+    def forward(self, input_ids, token_type_ids):
         """
-        input_ids is shape (B, T) where T is either 128 or 512
+        Forward pass for the embeddings.
+
+        Args:
+            input_ids: torch.Tensor
+                Tensor of input token IDs.
+            token_type_ids: torch.Tensor
+                Tensor of token type IDs.
+
+        Returns:
+            torch.Tensor: Combined embeddings.
         """
         T = input_ids.size(1)
         pos = torch.arange(0, T, dtype=torch.long, device=input_ids.device)
@@ -92,6 +102,14 @@ class BertEmbeddings(nn.Module):
 
 
 class ScaledDotProductAttention(nn.Module):
+    """
+    Scaled Dot-Product Attention mechanism.
+
+    Args:
+        config: BertConfig
+            Configuration for the BERT model.
+    """
+
     def __init__(self, config):
         super().__init__()
         assert config.hidden_size % config.num_attention_heads == 0
@@ -108,6 +126,16 @@ class ScaledDotProductAttention(nn.Module):
         self.hidden_size = config.hidden_size
 
     def forward(self, x):
+        """
+        Forward pass for the attention mechanism.
+
+        Args:
+            x: torch.Tensor
+                Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention.
+        """
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality
         x = self.norm(x)
 
@@ -150,32 +178,68 @@ class ScaledDotProductAttention(nn.Module):
 
 
 class BertFFN(nn.Module):
+    """
+    Feed-Forward Network (FFN) used in BERT.
+
+    Args:
+        config: BertConfig
+            Configuration for the BERT model.
+    """
+
     def __init__(self, config):
         super().__init__()
         self.scale_factor = 4
         self.layers = nn.Sequential(
             nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps),
             nn.Linear(config.hidden_size, config.hidden_size * self.scale_factor),
-            nn.GELU(),  # apprixmiate tanh?
+            nn.GELU(),  # approximate tanh?
             nn.Dropout(config.hidden_dropout_prob),
             nn.Linear(config.hidden_size * self.scale_factor, config.hidden_size),
             nn.Dropout(config.hidden_dropout_prob),
         )
 
     def forward(self, x):
+        """
+        Forward pass for the feed-forward network.
+
+        Args:
+            x: torch.Tensor
+                Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after applying the feed-forward network.
+        """
         return self.layers(x)
 
 
 class BertBlock(nn.Module):
+    """
+    Single block of the BERT model, consisting of attention and feed-forward layers.
+
+    Args:
+        config: BertConfig
+            Configuration for the BERT model.
+    """
+
     def __init__(self, config):
         """
-        Pre-LN helps stabilize training
+        Pre-LN helps stabilize training.
         """
         super().__init__()
         self.attention = ScaledDotProductAttention(config)
         self.ffn = BertFFN(config)
 
     def forward(self, x):
+        """
+        Forward pass for the BERT block.
+
+        Args:
+            x: torch.Tensor
+                Input tensor.
+
+        Returns:
+            torch.Tensor: Output tensor after applying attention and feed-forward layers.
+        """
         x += self.attention(x)
         x += self.ffn(x)
         return x
