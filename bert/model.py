@@ -362,8 +362,8 @@ class BertMLM(nn.Module):
 
     def __init__(self, config: BertConfig):
         super().__init__()
+        self.config = config
         self.bert = BertModel(config)
-
         pre_layer_norm = getattr(config, "pre_layer_norm", False)
         layers = []
         if pre_layer_norm:
@@ -380,8 +380,11 @@ class BertMLM(nn.Module):
         self.head = nn.Sequential(*layers)
         self.bias = nn.Parameter(torch.zeros(config.vocab_size))
 
-        # Initialize weights and apply final processing
-        self.post_init()
+        # weight sharing / weight tying
+        self.head[-1].weight = self.bert.embeddings.word_embeddings.weight
+
+        # Initialize weights
+        self.apply(self._init_weights)
 
     def _init_weights(self, module):
         """Initialize the weights"""
@@ -399,7 +402,9 @@ class BertMLM(nn.Module):
             module.bias.data.zero_()
             module.weight.data.fill_(1.0)
 
-    def forward(self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor, token_type_ids: torch.LongTensor):
+    def forward(
+        self, input_ids: torch.LongTensor, attention_mask: torch.LongTensor, token_type_ids: torch.LongTensor, **kwargs
+    ):
         """
         Forward pass for the BERT model with MLM head.
 
