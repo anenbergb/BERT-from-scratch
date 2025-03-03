@@ -1,3 +1,4 @@
+import torch
 from torch.optim import AdamW
 
 
@@ -21,3 +22,20 @@ def configure_optimizer(model, weight_decay=0.01, learning_rate=2e-5):
     ]
     optimizer = AdamW(optimizer_grouped_parameters, lr=learning_rate)
     return optimizer
+
+
+def get_lr_scheduler(optimizer, lr_warmup_iters, max_train_iters):
+    # Define full BERT-like schedule: warm-up (10k steps) + decay (990k steps)
+    def schedule(step):
+        warmup_steps = max(0, lr_warmup_iters)
+        total_decay_steps = max_train_iters - warmup_steps
+        if step < warmup_steps:
+            # Warm-up: 0 to 1e-4 over 10,000 steps
+            # LR will be 0 for the very first iteration
+            return step / warmup_steps
+        else:
+            # Decay: 1e-4 to 0 over 990,000 steps
+            decay_step = step - warmup_steps
+            return max(0.0, 1.0 - decay_step / total_decay_steps)
+
+    return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)

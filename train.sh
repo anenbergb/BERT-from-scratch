@@ -9,5 +9,10 @@ export ACCELERATE_LOG_LEVEL="INFO"
 # DEBUG
 accelerate launch --gpu_ids 0, --num_processes 1 bert/train.py \
 --output-dir /media/bryan/ssd01/expr/bert_from_scratch/debug01 \
---train-batch-size 32 --val-batch-size 32 \
---epochs 10 --lr-warmup-epochs 5 --limit-train-iters 10  --limit-val-iters 20
+--max-train-iters 1000 --lr-warmup-iters 100 --limit-val-iters 20
+
+
+# pre-layer-norm configuration
+# accelerate launch bert/train.py \
+# --output-dir /media/bryan/ssd01/expr/bert_from_scratch/debug01 \
+# --pre-layer-norm --lr 3e-4 --lr-warmup-iters 0
