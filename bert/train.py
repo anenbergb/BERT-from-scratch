@@ -9,8 +9,16 @@ from torch import nn
 from torch.utils.data import DataLoader
 from transformers import BertTokenizerFast
 
+
+# Huggingface
+from accelerate import Accelerator
+from accelerate.utils import ProjectConfiguration
+from safetensors.torch import load_model
+
+
 from bert.model import BertConfig, BertMLM
 from bert.data import load_pretraining_dataset, TrainingCollator
+from bert.utils import configure_optimizer
 
 
 @dataclass
@@ -40,8 +48,6 @@ class TrainingConfig:
     dataset_sample_limit: int = 100000  # 0 means no limit
     num_workers: int = field(default=2)
 
-    # Optimizer configuration
-    optimizer_name: str = field(default="adamw")
     # Linear warmup + CosineAnnealingLR
     # 2e-4 for AdamW
     lr: float = field(default=2e-4)
@@ -65,6 +71,25 @@ class TrainingConfig:
 
 
 def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
+    project_config = ProjectConfiguration(
+        project_dir=config.output_dir,
+        # logging_dir
+        automatic_checkpoint_naming=True,
+        total_limit=config.checkpoint_total_limit,
+        save_on_each_node=False,
+        iteration=config.start_epoch,  # the current save iteration
+    )
+    accelerator = Accelerator(
+        mixed_precision=config.mixed_precision,
+        log_with="tensorboard",
+        project_config=project_config,
+        step_scheduler_with_optimizer=False,
+        split_batches=False,
+    )
+    if accelerator.is_main_process:
+        os.makedirs(config.output_dir, exist_ok=True)
+        accelerator.init_trackers(os.path.basename(config.output_dir))
+
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     assert tokenizer.vocab_size == bert_config.vocab_size
 
@@ -84,6 +109,11 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         collate_fn=TrainingCollator(tokenizer, config.mask_lm_prob),
     )
     model = BertMLM(bert_config).to("cuda")
+
+    optimizer = configure_optimizer(model, config.weight_decay, config.lr)
+    criterion = nn.CrossEntropyLoss()
+    #  masked_lm_loss = loss_fct(prediction_scores.view(-1, self.config.vocab_size), labels.view(-1))
+
     for i, batch in enumerate(train_dataloader):
         if i > 100:
             break
