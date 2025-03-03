@@ -1,6 +1,7 @@
 from typing import Optional
 import torch
 import os
+from loguru import logger
 
 from datasets import concatenate_datasets, load_dataset, load_from_disk
 from transformers import default_data_collator, DataCollatorForWholeWordMask
@@ -87,5 +88,6 @@ def load_pretraining_dataset(
     else:
         dataset = prepare_pretraining_dataset(tokenizer, token_sequence_length, sample_limit)
         if dataset_cache_path is not None:
+            logger.info(f"Saving dataset to {dataset_cache_path}")
             dataset.save_to_disk(dataset_cache_path)
     return dataset

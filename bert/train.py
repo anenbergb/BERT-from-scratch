@@ -3,6 +3,7 @@ import argparse
 import sys
 import logging
 import os
+from loguru import logger
 
 import torch
 from torch import nn
@@ -27,22 +28,25 @@ class TrainingConfig:
     overwrite_output_dir: bool = field(default=True)  # overwrite the old model
     start_epoch: int = field(default=0)
     resume_from_checkpoint: str = field(default=None)
-    epochs: int = field(default=100)
+
+    # Track training by iterations ratehr than epochs
+    max_train_iters: int = field(default=1000000)
     limit_train_iters: int = field(default=0)
     limit_val_iters: int = field(default=0)
     checkpoint_total_limit: int = field(default=3)
-    checkpoint_epochs: int = field(default=1)
-    save_image_epochs: int = field(default=1)
-    eval_epochs: int = field(default=1)  # how often to evaluate the model
+    checkpoint_iters: int = field(default=5000)
+    evaluation_iters: int = field(default=5000)  # how often to evaluate the model
 
     seed: int = field(default=0)
     mixed_precision: str = field(default="bf16")  # no for float32
 
     # Dataloading
-    initial_dataset_cache_path: str = field(default=None)
-    max_dataset_cache_path: str = field(default=None)
+    initial_seq_len_dataset_cache_path: str = field(default=None)
+    max_seq_len_dataset_cache_path: str = field(default=None)
 
-    train_batch_size: int = field(default=128)
+    initial_seq_len_train_batch_size: int = field(default=128)
+    max_seq_len_train_batch_size: int = field(default=128)
+
     val_batch_size: int = field(default=256)
     # reduce the number of samples in the dataset for debugging purposes
     dataset_sample_limit: int = 100000  # 0 means no limit
@@ -50,8 +54,8 @@ class TrainingConfig:
 
     # Linear warmup + CosineAnnealingLR
     # 2e-4 for AdamW
-    lr: float = field(default=2e-4)
-    lr_warmup_epochs: int = field(default=5)
+    lr: float = field(default=1e-4)
+    lr_warmup_iters: int = field(default=10000)
     lr_warmup_decay: float = field(default=0.01)
     lr_min: float = field(default=0.0)
 
@@ -68,6 +72,49 @@ class TrainingConfig:
     # hard-coded to 10% of the time, the token is left unchanged
     initial_sequence_length: int = field(default=128)
     max_sequence_length: int = field(default=512)
+
+
+def load_initial_seq_len_dataloader(
+    config: TrainingConfig, tokenizer: BertTokenizerFast
+) -> DataLoader:
+    logger.info("Loading initial sequence length dataloader. seq_len={config.initial_sequence_length}")
+    tokenized_dataset = load_pretraining_dataset(
+        tokenizer,
+        dataset_cache_path=config.initial_seq_len_dataset_cache_path,
+        token_sequence_length=config.initial_sequence_length,
+        sample_limit=config.dataset_sample_limit,
+    )
+    logger.info(f"Tokenized dataset\n{tokenized_dataset}")
+    return DataLoader(
+        tokenized_dataset,
+        batch_size=config.initial_seq_len_train_batch_size,
+        shuffle=True,
+        pin_memory=True,
+        drop_last=True,
+        num_workers=config.num_workers,
+        collate_fn=TrainingCollator(tokenizer, config.mask_lm_prob),
+    )
+
+def load_max_seq_len_dataloader(
+    config: TrainingConfig, tokenizer: BertTokenizerFast
+) -> DataLoader:
+    logger.info("Loading max sequence length dataloader. seq_len={config.max_sequence_length}")
+    tokenized_dataset = load_pretraining_dataset(
+        tokenizer,
+        dataset_cache_path=config.max_seq_len_dataset_cache_path,
+        token_sequence_length=config.max_sequence_length,
+        sample_limit=config.dataset_sample_limit,
+    )
+    logger.info(f"Tokenized dataset\n{tokenized_dataset}")
+    return DataLoader(
+        tokenized_dataset,
+        batch_size=config.max_seq_len_train_batch_size,
+        shuffle=True,
+        pin_memory=True,
+        drop_last=True,
+        num_workers=config.num_workers,
+        collate_fn=TrainingCollator(tokenizer, config.mask_lm_prob),
+    )
 
 
 def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
@@ -93,21 +140,8 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     assert tokenizer.vocab_size == bert_config.vocab_size
 
-    tokenized_dataset = load_pretraining_dataset(
-        tokenizer,
-        dataset_cache_path=config.initial_dataset_cache_path,
-        token_sequence_length=config.initial_sequence_length,
-        sample_limit=config.dataset_sample_limit,
-    )
-    train_dataloader = DataLoader(
-        tokenized_dataset,
-        batch_size=config.train_batch_size,
-        shuffle=True,
-        pin_memory=True,
-        drop_last=True,
-        num_workers=config.num_workers,
-        collate_fn=TrainingCollator(tokenizer, config.mask_lm_prob),
-    )
+    initial_train_dataloader = load_initial_seq_len_dataloader(config, tokenizer)
+    max_train_dataloader = load_max_seq_len_dataloader(config, tokenizer)
     model = BertMLM(bert_config).to("cuda")
 
     optimizer = configure_optimizer(model, config.weight_decay, config.lr)
