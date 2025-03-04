@@ -343,6 +343,12 @@ Run Masked Language Model pre-training for BERT on the BookCorpus and English Wi
         help="Use pre-layer norm in the transformer",
     )
     parser.add_argument(
+        "--lr",
+        type=float,
+        default=1e-4,
+        help="Learning rate",
+    )
+    parser.add_argument(
         "--debug-dataset-sample-limit",
         type=int,
         default=0,
@@ -368,6 +374,7 @@ if __name__ == "__main__":
         initial_seq_len_dataset_cache_path=args.initial_dataset_cache_path,
         max_seq_len_dataset_cache_path=args.max_dataset_cache_path,
         dataset_sample_limit=args.debug_dataset_sample_limit,
+        lr=args.lr,
     )
     bert_config = BertConfig(pre_layer_norm=args.pre_layer_norm)
     sys.exit(train_mlm(config, bert_config))
