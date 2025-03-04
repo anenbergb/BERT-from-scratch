@@ -14,7 +14,7 @@ from transformers import BertTokenizerFast
 
 # Huggingface
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration
+from accelerate.utils import ProjectConfiguration, GradientAccumulationPlugin
 from safetensors.torch import load_model
 
 
@@ -45,12 +45,12 @@ class TrainingConfig:
     max_seq_len_dataset_cache_path: str = field(default=None)
 
     initial_seq_len_train_batch_size: int = field(default=128)
-    max_seq_len_train_batch_size: int = field(default=128)
+    max_seq_len_train_batch_size: int = field(default=24)
 
     val_batch_size: int = field(default=256)
     # reduce the number of samples in the dataset for debugging purposes
     dataset_sample_limit: int = 100000  # 0 means no limit
-    num_workers: int = field(default=2)
+    num_workers: int = field(default=0)
 
     # Linear warmup + CosineAnnealingLR
     # 2e-4 for AdamW
@@ -70,6 +70,7 @@ class TrainingConfig:
     # hard-coded to 10% of the time, the token is left unchanged
     initial_sequence_length: int = field(default=128)
     max_sequence_length: int = field(default=512)
+    percent_initial_seq_len: float = field(default=0.9)
 
 
 def load_initial_seq_len_dataloader(config: TrainingConfig, tokenizer: BertTokenizerFast) -> DataLoader:
@@ -112,6 +113,10 @@ def load_max_seq_len_dataloader(config: TrainingConfig, tokenizer: BertTokenizer
     )
 
 
+def num_gradient_accumulation_steps(batch_size, target_batch_size=256):
+    return target_batch_size // batch_size
+
+
 def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     project_config = ProjectConfiguration(
         project_dir=config.output_dir,
@@ -121,6 +126,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         save_on_each_node=False,
         iteration=config.start_iter,  # the current save iteration
     )
+
     accelerator = Accelerator(
         mixed_precision=config.mixed_precision,
         log_with="tensorboard",
@@ -129,7 +135,9 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         split_batches=False,
         # TODO: make suree we can scale up gradient accumulation for the
         # max sequence length batches https://huggingface.co/docs/accelerate/en/usage_guides/gradient_accumulation
-        gradient_accumulation_steps=2,  # accumulate up to 256 batch size
+        gradient_accumulation_steps=num_gradient_accumulation_steps(
+            config.initial_seq_len_train_batch_size
+        ),  # accumulate up to 256 batch size
     )
     if accelerator.is_main_process:
         os.makedirs(config.output_dir, exist_ok=True)
@@ -172,10 +180,16 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
 
     def get_dataloader(step):
         #  128 tokens for the first 90% of steps, then 512 tokens for the last 10%.
-        max_seq_len_start_iter = int(0.9 * config.max_train_iters)
+        max_seq_len_start_iter = int(config.percent_initial_seq_len * config.max_train_iters)
         if step < max_seq_len_start_iter:
+            accelerator.gradient_accumulation_steps = num_gradient_accumulation_steps(
+                config.initial_seq_len_train_batch_size
+            )
             return initial_train_dataloader
         else:
+            accelerator.gradient_accumulation_steps = num_gradient_accumulation_steps(
+                config.max_seq_len_train_batch_size
+            )
             return max_train_dataloader
 
     dataloader = iter(get_dataloader(config.start_iter))
@@ -186,16 +200,19 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
             desc="Training",
         )
     ):
-        if step == int(0.9 * config.max_train_iters):
+        print(f"Step: {step} grad_accum_steps {accelerator.gradient_accumulation_steps}")
+
+        if step == int(config.percent_initial_seq_len * config.max_train_iters):
             dataloader = iter(max_train_dataloader)
+            accelerator.gradient_accumulation_steps = num_gradient_accumulation_steps(
+                config.max_seq_len_train_batch_size
+            )
         try:
             batch = next(dataloader)
         except StopIteration:
             dataloader = iter(get_dataloader(step))
             batch = next(dataloader)
-
-        optimizer.zero_grad()
-        with accelerator.accumulate(model):
+        with accelerator.accumulate(model):  # accumulate gradients into model.grad attributes
             with accelerator.autocast():
                 logits = model(**batch)  # (N,seq_len,vocab_size)
                 # (N,seq_len,vocab_size) -> (N*seq_len, vocab_size), labels: (N,seq_len) -> (N*seq_len,)
@@ -205,6 +222,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
 
         optimizer.step()
         lr_scheduler.step()
+        optimizer.zero_grad()
         current_lr = lr_scheduler.get_last_lr()[0]
         logs = {
             "loss/train": loss.detach().item(),
@@ -232,7 +250,10 @@ Run Masked Language Model pre-training for BERT on the BookCorpus and English Wi
         default="/media/bryan/ssd01/expr/bert_from_scratch/run01",
         help="Path to save the model",
     )
-    parser.add_argument("--train-batch-size", type=int, default=128, help="Training batch size")
+    parser.add_argument(
+        "--initial-seq-len-train-batch-size", type=int, default=128, help="Initial sequence length batch size"
+    )
+    parser.add_argument("--max-seq-len-train-batch-size", type=int, default=24, help="Max sequence length batch size")
     parser.add_argument("--val-batch-size", type=int, default=256, help="Validation batch size")
     parser.add_argument("--max-train-iters", type=int, default=1000000, help="Maximum training iterations")
     parser.add_argument("--lr-warmup-iters", type=int, default=10000, help="Warmup iterations")
@@ -285,10 +306,14 @@ if __name__ == "__main__":
     args = get_args()
     config = TrainingConfig(
         output_dir=args.output_dir,
+        initial_seq_len_train_batch_size=args.initial_seq_len_train_batch_size,
+        max_seq_len_train_batch_size=args.max_seq_len_train_batch_size,
+        val_batch_size=args.val_batch_size,
+        max_train_iters=args.max_train_iters,
+        lr_warmup_iters=args.lr_warmup_iters,
+        limit_val_iters=args.limit_val_iters,
         start_iter=args.start_iter,
         resume_from_checkpoint=args.resume_from_checkpoint,
-        max_train_iters=args.max_train_iters,
-        limit_val_iters=args.limit_val_iters,
         evaluation_iters=args.evaluation_iters,
         initial_seq_len_dataset_cache_path=args.initial_dataset_cache_path,
         max_seq_len_dataset_cache_path=args.max_dataset_cache_path,
