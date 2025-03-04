@@ -44,6 +44,7 @@ class TrainingConfig:
     initial_seq_len_dataset_cache_path: str = field(default=None)
     max_seq_len_dataset_cache_path: str = field(default=None)
 
+    train_batch_size: int = field(default=256)
     initial_seq_len_train_batch_size: int = field(default=128)
     max_seq_len_train_batch_size: int = field(default=24)
 
@@ -70,7 +71,8 @@ class TrainingConfig:
     # hard-coded to 10% of the time, the token is left unchanged
     initial_sequence_length: int = field(default=128)
     max_sequence_length: int = field(default=512)
-    percent_initial_seq_len: float = field(default=0.9)
+
+    initial_seq_len_training_fraction: float = field(default=0.9)
 
 
 def load_initial_seq_len_dataloader(config: TrainingConfig, tokenizer: BertTokenizerFast) -> DataLoader:
@@ -113,8 +115,81 @@ def load_max_seq_len_dataloader(config: TrainingConfig, tokenizer: BertTokenizer
     )
 
 
-def num_gradient_accumulation_steps(batch_size, target_batch_size=256):
-    return target_batch_size // batch_size
+class DataloaderIterator:
+    """
+    128 tokens for the first 90% of steps, then 512 tokens for the last 10%.
+    """
+
+    def __init__(self, dataloader1, dataloader2, accelerator, config: TrainingConfig):
+        self.dataloader1 = dataloader1
+        self.dataloader2 = dataloader2
+        self.config = config
+        self.accelerator = accelerator
+
+        self.initial_seq_gradient_accumulation_steps = (
+            config.train_batch_size // config.initial_seq_len_train_batch_size
+        )
+        self.max_seq_gradient_accumulation_steps = config.train_batch_size // config.max_seq_len_train_batch_size
+
+        self.initial_seq_length_training_frac = self.get_initial_seq_len_training_fraction()
+        self.max_seq_len_start_iter = int(self.initial_seq_length_training_frac * config.max_train_iters)
+
+        ### print some info
+        accelerator.print(
+            f"By default, the model is pre-trained with sequences of length {config.initial_sequence_length} "
+            f"for {config.initial_seq_len_training_fraction:.0%} of the steps and with sequences of length "
+            f"{config.max_sequence_length} for the remaining steps.\n"
+            f"Given the target batch size of {config.train_batch_size}, the gradient accumulation steps are "
+            f"{self.initial_seq_gradient_accumulation_steps} for the {config.initial_sequence_length} length sequences "
+            f"[batch_size {config.initial_seq_len_train_batch_size}] and "
+            f"{self.max_seq_gradient_accumulation_steps} for the {config.max_sequence_length} length sequences "
+            f"[batch_size {config.max_seq_len_train_batch_size}].\n"
+            f"As a result, the initial sequence length training fraction is rescaled from {config.initial_seq_len_training_fraction:.0%} "
+            f"to {self.initial_seq_length_training_frac:.0%} to account for the difference in gradient accumulation steps.\n"
+            f"The training will start with sequences of length {config.initial_sequence_length} for the first "
+            f"{self.max_seq_len_start_iter} steps and then switch to sequences of length "
+            f"{config.max_sequence_length} for the remaining steps."
+        )
+        self.iter = iter(self.get_dataloader(config.start_iter))
+        self.step = config.start_iter
+
+    def get_initial_seq_len_training_fraction(self):
+        """
+        Rescale the initial sequence length training fraction to account for the
+        the difference in gradient accumulation steps required for due to batch size
+        difference between the initial sequence length and max sequence length.
+        """
+        frac = self.config.initial_seq_len_training_fraction
+        iga = self.initial_seq_gradient_accumulation_steps
+        mga = self.max_seq_gradient_accumulation_steps
+        return frac * iga / (frac * iga + (1 - frac) * mga)
+
+    def get_dataloader(self, step):
+        if step < self.max_seq_len_start_iter:
+            self.accelerator.gradient_accumulation_steps = self.initial_seq_gradient_accumulation_steps
+            return self.dataloader1
+        else:
+            self.accelerator.gradient_accumulation_steps = self.max_seq_gradient_accumulation_steps
+            return self.dataloader2
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.step >= self.config.max_train_iters:
+            raise StopIteration
+        if self.step == self.max_seq_len_start_iter:
+            self.iter = iter(self.get_dataloader(self.step))
+        try:
+            batch = next(self.iter)
+        except StopIteration:
+            self.iter = iter(self.get_dataloader(self.step))
+            batch = next(self.iter)
+        self.step += 1
+        return batch
+
+    def __len__(self):
+        return config.max_train_iters - config.start_iter
 
 
 def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
@@ -133,11 +208,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         project_config=project_config,
         step_scheduler_with_optimizer=False,
         split_batches=False,
-        # TODO: make suree we can scale up gradient accumulation for the
-        # max sequence length batches https://huggingface.co/docs/accelerate/en/usage_guides/gradient_accumulation
-        gradient_accumulation_steps=num_gradient_accumulation_steps(
-            config.initial_seq_len_train_batch_size
-        ),  # accumulate up to 256 batch size
+        gradient_accumulation_steps=2,  # will be set in DataLoaderIter
     )
     if accelerator.is_main_process:
         os.makedirs(config.output_dir, exist_ok=True)
@@ -178,40 +249,15 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         for _ in range(config.start_iter):
             lr_scheduler.step()
 
-    def get_dataloader(step):
-        #  128 tokens for the first 90% of steps, then 512 tokens for the last 10%.
-        max_seq_len_start_iter = int(config.percent_initial_seq_len * config.max_train_iters)
-        if step < max_seq_len_start_iter:
-            accelerator.gradient_accumulation_steps = num_gradient_accumulation_steps(
-                config.initial_seq_len_train_batch_size
-            )
-            return initial_train_dataloader
-        else:
-            accelerator.gradient_accumulation_steps = num_gradient_accumulation_steps(
-                config.max_seq_len_train_batch_size
-            )
-            return max_train_dataloader
-
-    dataloader = iter(get_dataloader(config.start_iter))
-    for step in (
+    dataloader_iter = DataloaderIterator(initial_train_dataloader, max_train_dataloader, accelerator, config)
+    for step, batch in (
         progress_bar := tqdm(
-            range(config.start_iter, config.max_train_iters),
+            enumerate(dataloader_iter, start=config.start_iter),
+            total=len(dataloader_iter),
             disable=not accelerator.is_local_main_process,
             desc="Training",
         )
     ):
-        print(f"Step: {step} grad_accum_steps {accelerator.gradient_accumulation_steps}")
-
-        if step == int(config.percent_initial_seq_len * config.max_train_iters):
-            dataloader = iter(max_train_dataloader)
-            accelerator.gradient_accumulation_steps = num_gradient_accumulation_steps(
-                config.max_seq_len_train_batch_size
-            )
-        try:
-            batch = next(dataloader)
-        except StopIteration:
-            dataloader = iter(get_dataloader(step))
-            batch = next(dataloader)
         with accelerator.accumulate(model):  # accumulate gradients into model.grad attributes
             with accelerator.autocast():
                 logits = model(**batch)  # (N,seq_len,vocab_size)
