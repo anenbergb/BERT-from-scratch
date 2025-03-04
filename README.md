@@ -178,3 +178,7 @@ Consider freezing lower layers and only fine-tuning the top layers or classifier
 
 * gradient accumulation shoudl be used to achieve larger effective batch size
 * early stopping may be performed to halt training if performance plateaus
+
+Gradient accumulation reduces the effective number of iterations.
+If initial batch size is 128, then gradient accumulation = 2 is required
+If max batch size is 24, then 10x is required.

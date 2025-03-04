@@ -9,7 +9,7 @@ from tqdm import tqdm
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from transformers import BertTokenizerFast
+from transformers import BertTokenizer, BertTokenizerFast
 
 
 # Huggingface
@@ -50,8 +50,8 @@ class TrainingConfig:
 
     val_batch_size: int = field(default=256)
     # reduce the number of samples in the dataset for debugging purposes
-    dataset_sample_limit: int = 100000  # 0 means no limit
-    num_workers: int = field(default=0)
+    dataset_sample_limit: int = field(default=0)  # 0 means no limit
+    num_workers: int = field(default=2)
 
     # Linear warmup + CosineAnnealingLR
     # 2e-4 for AdamW
@@ -75,43 +75,35 @@ class TrainingConfig:
     initial_seq_len_training_fraction: float = field(default=0.9)
 
 
-def load_initial_seq_len_dataloader(config: TrainingConfig, tokenizer: BertTokenizerFast) -> DataLoader:
-    logger.info(f"Loading initial sequence length dataloader. seq_len={config.initial_sequence_length}")
+def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=True) -> DataLoader:
+    tokenizer_fast = BertTokenizerFast.from_pretrained("bert-base-uncased")
+    tokenizer_slow = BertTokenizer.from_pretrained("bert-base-uncased")
+
+    if select_initial_seq_len:
+        sequence_length = config.initial_sequence_length
+        dataset_cache_path = config.initial_seq_len_dataset_cache_path
+        batch_size = config.initial_seq_len_train_batch_size
+    else:
+        sequence_length = config.max_sequence_length
+        dataset_cache_path = config.max_seq_len_dataset_cache_path
+        batch_size = config.max_seq_len_train_batch_size
+
+    logger.info(f"Loading {sequence_length} length sequence dataloader")
     tokenized_dataset = load_pretraining_dataset(
-        tokenizer,
-        dataset_cache_path=config.initial_seq_len_dataset_cache_path,
-        token_sequence_length=config.initial_sequence_length,
+        tokenizer_fast,
+        dataset_cache_path=dataset_cache_path,
+        token_sequence_length=sequence_length,
         sample_limit=config.dataset_sample_limit,
     )
     logger.info(f"Tokenized dataset\n{tokenized_dataset}")
     return DataLoader(
         tokenized_dataset,
-        batch_size=config.initial_seq_len_train_batch_size,
+        batch_size=batch_size,
         shuffle=True,
         pin_memory=True,
         drop_last=True,
         num_workers=config.num_workers,
-        collate_fn=TrainingCollator(tokenizer, config.mask_lm_prob),
-    )
-
-
-def load_max_seq_len_dataloader(config: TrainingConfig, tokenizer: BertTokenizerFast) -> DataLoader:
-    logger.info(f"Loading max sequence length dataloader. seq_len={config.max_sequence_length}")
-    tokenized_dataset = load_pretraining_dataset(
-        tokenizer,
-        dataset_cache_path=config.max_seq_len_dataset_cache_path,
-        token_sequence_length=config.max_sequence_length,
-        sample_limit=config.dataset_sample_limit,
-    )
-    logger.info(f"Tokenized dataset\n{tokenized_dataset}")
-    return DataLoader(
-        tokenized_dataset,
-        batch_size=config.max_seq_len_train_batch_size,
-        shuffle=True,
-        pin_memory=True,
-        drop_last=True,
-        num_workers=config.num_workers,
-        collate_fn=TrainingCollator(tokenizer, config.mask_lm_prob),
+        collate_fn=TrainingCollator(tokenizer_slow, config.mask_lm_prob),
     )
 
 
@@ -217,8 +209,8 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     assert tokenizer.vocab_size == bert_config.vocab_size
 
-    initial_train_dataloader = load_initial_seq_len_dataloader(config, tokenizer)
-    max_train_dataloader = load_max_seq_len_dataloader(config, tokenizer)
+    initial_train_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=True)
+    max_train_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
     model = BertMLM(bert_config)
     criterion = nn.CrossEntropyLoss()
     optimizer = configure_optimizer(model, config.weight_decay, config.lr)
@@ -266,6 +258,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
                 loss = criterion(logits.view(-1, bert_config.vocab_size), batch["labels"].view(-1))
             accelerator.backward(loss)  # accumulates gradients
 
+        accelerator.clip_grad_norm_(model.parameters(), config.gradient_max_norm)
         optimizer.step()
         lr_scheduler.step()
         optimizer.zero_grad()
@@ -274,12 +267,17 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
             "loss/train": loss.detach().item(),
             "lr": current_lr,
         }
+        accelerator.log(logs, step=step)
         progress_bar.set_postfix(**logs)
+
+        if step % config.checkpoint_iters == 0 or step == config.max_train_iters - 1:
+            accelerator.save_state()
 
         if step % config.evaluation_iters == 0 or step == config.max_train_iters - 1:
             # Evaluation
             pass
 
+    accelerator.end_training()
     return 0
 
 
@@ -344,6 +342,12 @@ Run Masked Language Model pre-training for BERT on the BookCorpus and English Wi
         action="store_true",
         help="Use pre-layer norm in the transformer",
     )
+    parser.add_argument(
+        "--debug-dataset-sample-limit",
+        type=int,
+        default=0,
+        help="Limit the number of samples in the dataset for debugging purposes",
+    )
     return parser.parse_args()
 
 
@@ -363,6 +367,7 @@ if __name__ == "__main__":
         evaluation_iters=args.evaluation_iters,
         initial_seq_len_dataset_cache_path=args.initial_dataset_cache_path,
         max_seq_len_dataset_cache_path=args.max_dataset_cache_path,
+        dataset_sample_limit=args.debug_dataset_sample_limit,
     )
     bert_config = BertConfig(pre_layer_norm=args.pre_layer_norm)
     sys.exit(train_mlm(config, bert_config))
