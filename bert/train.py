@@ -20,7 +20,7 @@ from safetensors.torch import load_model
 
 from bert.model import BertConfig, BertMLM
 from bert.data import load_pretraining_dataset, TrainingCollator, TrainingCollatorForTest
-from bert.utils import configure_optimizer, get_lr_scheduler, decode_batch
+from bert.utils import configure_optimizer, get_lr_scheduler, decode_batch, worker_init_fn, set_seeds
 
 
 @dataclass
@@ -52,7 +52,7 @@ class TrainingConfig:
     val_batch_size: int = field(default=128)
     # reduce the number of samples in the dataset for debugging purposes
     dataset_sample_limit: int = field(default=0)  # 0 means no limit
-    num_workers: int = field(default=2)
+    num_workers: int = field(default=0)
 
     # Linear warmup + CosineAnnealingLR
     # 2e-4 for AdamW
@@ -109,19 +109,22 @@ def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=Tru
         num_workers=config.num_workers,
         collate_fn=TrainingCollator(tokenizer_slow, config.mask_lm_prob),
     )
+
+    # set_seeds(config.seed)
     test_loader = DataLoader(
         tokenized_dataset["test"],
         batch_size=config.val_batch_size,
-        shuffle=False,
+        shuffle=True,
         pin_memory=True,
         drop_last=False,
         num_workers=config.num_workers,
         collate_fn=TrainingCollatorForTest(tokenizer_slow, config.mask_lm_prob, random_seed=config.seed),
+        # worker_init_fn=worker_init_fn,
     )
     return train_loader, test_loader
 
 
-class DataloaderIterator:
+class DataloaderIteratorInitialThenMax:
     """
     128 tokens for the first 90% of steps, then 512 tokens for the last 10%.
     """
@@ -140,7 +143,6 @@ class DataloaderIterator:
         self.initial_seq_length_training_frac = self.get_initial_seq_len_training_fraction()
         self.max_seq_len_start_iter = int(self.initial_seq_length_training_frac * config.max_train_iters)
 
-        ### print some info
         accelerator.print(
             f"By default, the model is pre-trained with sequences of length {config.initial_sequence_length} "
             f"for {config.initial_seq_len_training_fraction:.0%} of the steps and with sequences of length "
@@ -199,6 +201,48 @@ class DataloaderIterator:
         return config.max_train_iters - config.start_iter
 
 
+class DataloaderIterator:
+
+    def __init__(self, dataloader, accelerator, config: TrainingConfig):
+        self.dataloader = dataloader
+        self.config = config
+        self.accelerator = accelerator
+
+        self.initial_seq_gradient_accumulation_steps = (
+            config.train_batch_size // config.initial_seq_len_train_batch_size
+        )
+
+        accelerator.print(
+            f"By default, the model is pre-trained with sequences of length {config.initial_sequence_length} "
+            f"for {config.initial_seq_len_training_fraction:.0%} of the steps and with sequences of length "
+            f"{config.max_sequence_length} for the remaining steps.\n"
+            f"In this 'train-only-with-initial-seq-len' mode, the model is pre-trained only with sequences of length "
+            f"{config.initial_sequence_length} for the entire training.\n"
+            f"Given the target batch size of {config.train_batch_size}, the gradient accumulation steps are "
+            f"{self.initial_seq_gradient_accumulation_steps} for the {config.initial_sequence_length} length sequences "
+            f"[batch_size {config.initial_seq_len_train_batch_size}]"
+        )
+        self.iter = iter(self.dataloader)
+        self.step = config.start_iter
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self.step >= self.config.max_train_iters:
+            raise StopIteration
+        try:
+            batch = next(self.iter)
+        except StopIteration:
+            self.iter = iter(self.dataloader)
+            batch = next(self.iter)
+        self.step += 1
+        return batch
+
+    def __len__(self):
+        return config.max_train_iters - config.start_iter
+
+
 def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     project_config = ProjectConfiguration(
         project_dir=config.output_dir,
@@ -227,13 +271,17 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     if config.train_only_with_initial_seq_len:
         train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=True)
         train_dataloader, val_dataloader = accelerator.prepare(train_dataloader, val_dataloader)
+
+        train_dataiterator = DataloaderIterator(train_dataloader, accelerator, config)
     else:
         initial_train_dataloader, _ = load_tokenized_dataloader(config, select_initial_seq_len=True)
         max_train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
         initial_train_dataloader, max_train_dataloader, val_dataloader = accelerator.prepare(
             initial_train_dataloader, max_train_dataloader, val_dataloader
         )
-        train_dataloader = DataloaderIterator(initial_train_dataloader, max_train_dataloader, accelerator, config)
+        train_dataiterator = DataloaderIteratorInitialThenMax(
+            initial_train_dataloader, max_train_dataloader, accelerator, config
+        )
 
     model = BertMLM(bert_config)
     criterion = nn.CrossEntropyLoss()  # ignore_index = -100
@@ -264,10 +312,12 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         for _ in range(config.start_iter):
             lr_scheduler.step()
 
+    accelerator.print(f"Training from {config.start_iter} to {config.max_train_iters}")
+    model.train()
     for step, batch in (
         progress_bar := tqdm(
-            enumerate(train_dataloader, start=config.start_iter),
-            total=len(train_dataloader),
+            enumerate(train_dataiterator, start=config.start_iter),
+            total=len(train_dataiterator),
             disable=not accelerator.is_local_main_process,
             desc="Training",
         )
@@ -278,6 +328,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
                 # (N,seq_len,vocab_size) -> (N*seq_len, vocab_size), labels: (N,seq_len) -> (N*seq_len,)
                 # all of the non-masked tokens are -100, so they are ignored in the loss calculation
                 loss = criterion(logits.view(-1, bert_config.vocab_size), batch["labels"].view(-1))
+                perplexity = torch.exp(loss)
             accelerator.backward(loss)  # accumulates gradients
 
         accelerator.clip_grad_norm_(model.parameters(), config.gradient_max_norm)
@@ -285,7 +336,12 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         lr_scheduler.step()
         optimizer.zero_grad()
         current_lr = lr_scheduler.get_last_lr()[0]
-        logs = {"loss/train": loss.detach().item(), "lr": current_lr, "sequence_length": batch["labels"].size(1)}
+        logs = {
+            "loss/train": loss.detach().item(),
+            "perplexity/train": perplexity.detach().item(),
+            "lr": current_lr,
+            "sequence_length": batch["labels"].size(1),
+        }
         accelerator.log(logs, step=step)
         progress_bar.set_postfix(**logs)
 
@@ -298,6 +354,11 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
                 accelerator, model, criterion, val_dataloader, limit_val_iters=config.limit_val_iters, global_step=step
             )
             if accelerator.is_main_process:
+                val_print_str = (
+                    f"Validation metrics [Iteration {step}]: "
+                    f"loss = {val_metrics['loss/val']:.2f}, perplexity = {val_metrics['perplexity/val']:.2f}"
+                )
+                accelerator.print(val_print_str)
                 accelerator.log(val_metrics, step=step)
 
     accelerator.end_training()
@@ -317,8 +378,8 @@ def run_validation(
     """
 
     val_dataloader.collate_fn.reset_call_counter()
-    total_num_samples = len(val_dataloader.dataset)
-    avg_loss = 0.0
+    total_mask_tokens = 0
+    total_loss = 0.0
     model.eval()
     with torch.inference_mode():
         for step, batch in tqdm(
@@ -333,7 +394,9 @@ def run_validation(
                 logits = model(**batch)
                 loss = criterion(logits.view(-1, bert_config.vocab_size), batch["labels"].view(-1))
 
-            avg_loss += loss.detach().item() * batch["input_ids"].size(0) / total_num_samples
+            num_mask_tokens = torch.count_nonzero(batch["labels"] != -100).item()
+            total_mask_tokens += num_mask_tokens
+            total_loss += loss.detach().item() * num_mask_tokens
 
             if step == 0:
                 batch = {k: v.detach().cpu() for k, v in batch.items()}
@@ -354,9 +417,14 @@ def run_validation(
                     logs[f"val-text-{batch_index}"] = decoded_text
                 accelerator.log(logs, step=global_step)
 
-    val_metrics = {}
-    val_metrics["loss/val"] = avg_loss
+    avg_loss = total_loss / total_mask_tokens
+    avg_perplexity = torch.exp(torch.tensor(avg_loss)).item()
+    val_metrics = {
+        "loss/val": avg_loss,
+        "perplexity/val": avg_perplexity,
+    }
     torch.cuda.empty_cache()
+    model.train()
     return val_metrics
 
 
