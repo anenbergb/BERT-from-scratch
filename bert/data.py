@@ -113,6 +113,9 @@ class DataCollatorForWholeWordMaskDeterministic(DataCollatorForWholeWordMask):
         self.call_counter += 1
         return super().__call__(features, return_tensors)
 
+    def reset_call_counter(self):
+        self.call_counter = 0
+
     def torch_mask_tokens(self, inputs: Any, mask_labels: Any) -> Tuple[Any, Any]:
         """
         Prepare masked tokens inputs/labels for masked language modeling: 80% MASK, 10% random, 10% original. Set
@@ -141,3 +144,25 @@ class DataCollatorForWholeWordMaskDeterministic(DataCollatorForWholeWordMask):
         labels[~masked_indices] = -100  # We only compute loss on masked tokens
         inputs[masked_indices] = self.tokenizer.convert_tokens_to_ids(self.tokenizer.mask_token)
         return inputs, labels
+
+
+class TrainingCollatorForTest:
+    def __init__(self, tokenizer, mask_lm_prob=0.15, random_seed=0):
+        self.pass_through_keys = ["token_type_ids", "attention_mask"]
+        self.tokenizer = tokenizer
+        self.collator = DataCollatorForWholeWordMaskDeterministic(
+            tokenizer, mlm=True, mlm_probability=mask_lm_prob, return_tensors="pt", random_seed=random_seed
+        )
+
+    def reset_call_counter(self):
+        self.collator.reset_call_counter()
+
+    def __call__(self, examples):
+        pass_through_examples = []
+        for example in examples:
+            pass_through = {key: example[key] for key in self.pass_through_keys}
+            pass_through["original_input_ids"] = example["input_ids"].copy()
+            pass_through_examples.append(pass_through)
+
+        batch = {**default_data_collator(pass_through_examples, return_tensors="pt"), **self.collator(examples)}
+        return batch

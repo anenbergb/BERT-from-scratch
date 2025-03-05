@@ -19,8 +19,8 @@ from safetensors.torch import load_model
 
 
 from bert.model import BertConfig, BertMLM
-from bert.data import load_pretraining_dataset, TrainingCollator
-from bert.utils import configure_optimizer, get_lr_scheduler
+from bert.data import load_pretraining_dataset, TrainingCollator, TrainingCollatorForTest
+from bert.utils import configure_optimizer, get_lr_scheduler, decode_batch
 
 
 @dataclass
@@ -49,7 +49,7 @@ class TrainingConfig:
     initial_seq_len_train_batch_size: int = field(default=128)
     max_seq_len_train_batch_size: int = field(default=24)
 
-    val_batch_size: int = field(default=256)
+    val_batch_size: int = field(default=128)
     # reduce the number of samples in the dataset for debugging purposes
     dataset_sample_limit: int = field(default=0)  # 0 means no limit
     num_workers: int = field(default=2)
@@ -99,8 +99,8 @@ def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=Tru
         random_seed=config.seed,
     )
     logger.info(f"Tokenized dataset\n{tokenized_dataset}")
-    return DataLoader(
-        tokenized_dataset,
+    train_loader = DataLoader(
+        tokenized_dataset["train"],
         batch_size=batch_size,
         shuffle=True,
         pin_memory=True,
@@ -108,6 +108,16 @@ def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=Tru
         num_workers=config.num_workers,
         collate_fn=TrainingCollator(tokenizer_slow, config.mask_lm_prob),
     )
+    test_loader = DataLoader(
+        tokenized_dataset["test"],
+        batch_size=config.val_batch_size,
+        shuffle=False,
+        pin_memory=True,
+        drop_last=False,
+        num_workers=config.num_workers,
+        collate_fn=TrainingCollatorForTest(tokenizer_slow, config.mask_lm_prob, random_seed=config.seed),
+    )
+    return train_loader, test_loader
 
 
 class DataloaderIterator:
@@ -212,15 +222,17 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     assert tokenizer.vocab_size == bert_config.vocab_size
 
-    initial_train_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=True)
-    max_train_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
+    initial_train_dataloader, _ = load_tokenized_dataloader(config, select_initial_seq_len=True)
+    max_train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
     model = BertMLM(bert_config)
     criterion = nn.CrossEntropyLoss()  # ignore_index = -100
     optimizer = configure_optimizer(model, config.weight_decay, config.lr)
     lr_scheduler = get_lr_scheduler(optimizer, config.lr_warmup_iters, config.max_train_iters)
 
-    model, optimizer, initial_train_dataloader, max_train_dataloader, criterion, lr_scheduler = accelerator.prepare(
-        model, optimizer, initial_train_dataloader, max_train_dataloader, criterion, lr_scheduler
+    model, optimizer, criterion, lr_scheduler, initial_train_dataloader, max_train_dataloader, val_dataloader = (
+        accelerator.prepare(
+            model, optimizer, criterion, lr_scheduler, initial_train_dataloader, max_train_dataloader, val_dataloader
+        )
     )
 
     # TODO fix model saving names?
@@ -229,13 +241,13 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         model_fpath = os.path.join(config.resume_from_checkpoint, "model.safetensors")
         assert os.path.exists(model_fpath), f"Model file {model_fpath} not found"
         accelerator.print(f"Loading model weights from {model_fpath}")
-        weights_before = model.module.bias.detach().clone()
+        weights_before = model.bias.detach().clone()
         load_model(
             accelerator._models[0],
             model_fpath,
             device=str(accelerator.device),
         )
-        weight_after = model.module.bias.detach().clone()
+        weight_after = model.bias.detach().clone()
         assert not torch.allclose(
             weights_before, weight_after
         ), "Model weights did not change after loading from checkpoint"
@@ -275,17 +287,74 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
             accelerator.save_state()
 
         if step % config.evaluation_iters == 0 or step == config.max_train_iters - 1:
-            # Evaluation
-            pass
+            val_metrics = run_validation(
+                accelerator, model, criterion, val_dataloader, limit_val_iters=config.limit_val_iters, global_step=step
+            )
+            if accelerator.is_main_process:
+                accelerator.log(val_metrics, step=step)
 
     accelerator.end_training()
     return 0
 
 
+def run_validation(
+    accelerator: Accelerator,
+    model: nn.Module,
+    criterion: nn.Module,
+    val_dataloader: DataLoader,
+    limit_val_iters: int = 0,
+    global_step: int = 0,
+):
+    """
+    NOTE: This function is written without consideration for distributed multi-GPU training.
+    """
+
+    val_dataloader.collate_fn.reset_call_counter()
+    total_num_samples = len(val_dataloader.dataset)
+    avg_loss = 0.0
+    model.eval()
+    with torch.inference_mode():
+        for step, batch in tqdm(
+            enumerate(val_dataloader),
+            total=len(val_dataloader) if limit_val_iters == 0 else limit_val_iters,
+            disable=not accelerator.is_local_main_process,
+            desc="Validation",
+        ):
+            if limit_val_iters > 0 and step >= limit_val_iters:
+                break
+            with accelerator.autocast():
+                logits = model(**batch)
+                loss = criterion(logits.view(-1, bert_config.vocab_size), batch["labels"].view(-1))
+
+            avg_loss += loss.detach().item() * batch["input_ids"].size(0) / total_num_samples
+
+            if step == 0:
+                batch = {k: v.detach().cpu() for k, v in batch.items()}
+                logits = logits.detach().cpu()
+                tokenizer = val_dataloader.collate_fn.tokenizer
+                decoded_batch = decode_batch(tokenizer, batch, logits, topk=3, with_prob=True)
+                logs = {}
+                for decoded in decoded_batch:
+                    decoded_text = ""
+                    for i, (k, v) in enumerate(decoded.items()):
+                        tabs = "\t\t" if k == "text" else "\t"
+                        text = f"{k}{tabs}{v}"
+                        if i < len(decoded) - 1:
+                            text += "\n"
+                        decoded_text += text
+                    logs[f"val-text/{i}"] = decoded_text
+                accelerator.log(logs, step=global_step)
+
+    val_metrics = {}
+    val_metrics["loss/val"] = avg_loss
+    return val_metrics
+
+
 def get_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         """
-Run Masked Language Model pre-training for BERT on the BookCorpus and English Wikipedia datasets.
+Run Masked Language Model pre-training for BERT on the BookCorpus and English Wikipedia datasets.\n
+This trainer is written without consideration for distributed multi-GPU training.
 """,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
@@ -299,7 +368,7 @@ Run Masked Language Model pre-training for BERT on the BookCorpus and English Wi
         "--initial-seq-len-train-batch-size", type=int, default=128, help="Initial sequence length batch size"
     )
     parser.add_argument("--max-seq-len-train-batch-size", type=int, default=24, help="Max sequence length batch size")
-    parser.add_argument("--val-batch-size", type=int, default=256, help="Validation batch size")
+    parser.add_argument("--val-batch-size", type=int, default=64, help="Validation batch size")
     parser.add_argument("--max-train-iters", type=int, default=1000000, help="Maximum training iterations")
     parser.add_argument("--lr-warmup-iters", type=int, default=10000, help="Warmup iterations")
     parser.add_argument(
