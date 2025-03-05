@@ -97,32 +97,3 @@ def decode_batch(tokenizer, batch, token_logits, topk=2, with_prob=True):
             )
         output.append(decoded)
     return output
-
-
-def compute_perplexity(loss):
-    """
-    Compute the perplexity given the cross-entropy loss.
-
-    Args:
-        loss: torch.Tensor
-            Cross-entropy loss.
-
-    Returns:
-        float: Perplexity score.
-    """
-    return torch.exp(loss).item()
-
-
-# Worker initialization function for deterministic shuffling
-def worker_init_fn(worker_id):
-    worker_seed = torch.initial_seed() % 2**32 + worker_id  # Base seed + worker offset
-    random.seed(worker_seed)
-    np.random.seed(worker_seed)  # If your dataset uses NumPy randomness
-
-
-# Set seeds for reproducibility
-def set_seeds(seed):
-    torch.manual_seed(seed)
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.cuda.manual_seed_all(seed)  # If using GPU

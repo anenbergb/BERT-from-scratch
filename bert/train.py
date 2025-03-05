@@ -5,6 +5,7 @@ import logging
 import os
 from loguru import logger
 from tqdm import tqdm
+from typing import Callable
 
 import torch
 from torch import nn
@@ -110,18 +111,22 @@ def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=Tru
         collate_fn=TrainingCollator(tokenizer_slow, config.mask_lm_prob),
     )
 
-    # set_seeds(config.seed)
-    test_loader = DataLoader(
-        tokenized_dataset["test"],
-        batch_size=config.val_batch_size,
-        shuffle=True,
-        pin_memory=True,
-        drop_last=False,
-        num_workers=config.num_workers,
-        collate_fn=TrainingCollatorForTest(tokenizer_slow, config.mask_lm_prob, random_seed=config.seed),
-        # worker_init_fn=worker_init_fn,
-    )
-    return train_loader, test_loader
+    def build_val_dataloader():
+        random_generator = torch.Generator()
+        random_generator.manual_seed(config.seed)
+        test_loader = DataLoader(
+            tokenized_dataset["test"],
+            batch_size=config.val_batch_size,
+            shuffle=True,
+            pin_memory=True,
+            drop_last=False,
+            num_workers=config.num_workers,
+            collate_fn=TrainingCollatorForTest(tokenizer_slow, config.mask_lm_prob, random_seed=config.seed),
+            generator=random_generator,
+        )
+        return test_loader
+
+    return train_loader, build_val_dataloader
 
 
 class DataloaderIteratorInitialThenMax:
@@ -269,15 +274,14 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     assert tokenizer.vocab_size == bert_config.vocab_size
 
     if config.train_only_with_initial_seq_len:
-        train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=True)
-        train_dataloader, val_dataloader = accelerator.prepare(train_dataloader, val_dataloader)
-
+        train_dataloader, build_val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=True)
+        train_dataloader = accelerator.prepare(train_dataloader)
         train_dataiterator = DataloaderIterator(train_dataloader, accelerator, config)
     else:
         initial_train_dataloader, _ = load_tokenized_dataloader(config, select_initial_seq_len=True)
-        max_train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
-        initial_train_dataloader, max_train_dataloader, val_dataloader = accelerator.prepare(
-            initial_train_dataloader, max_train_dataloader, val_dataloader
+        max_train_dataloader, build_val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
+        initial_train_dataloader, max_train_dataloader = accelerator.prepare(
+            initial_train_dataloader, max_train_dataloader
         )
         train_dataiterator = DataloaderIteratorInitialThenMax(
             initial_train_dataloader, max_train_dataloader, accelerator, config
@@ -351,7 +355,12 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         if step > 0 and (step % config.evaluation_iters == 0 or step == config.max_train_iters - 1):
             torch.cuda.empty_cache()
             val_metrics = run_validation(
-                accelerator, model, criterion, val_dataloader, limit_val_iters=config.limit_val_iters, global_step=step
+                accelerator,
+                model,
+                criterion,
+                build_val_dataloader,
+                limit_val_iters=config.limit_val_iters,
+                global_step=step,
             )
             if accelerator.is_main_process:
                 val_print_str = (
@@ -369,15 +378,16 @@ def run_validation(
     accelerator: Accelerator,
     model: nn.Module,
     criterion: nn.Module,
-    val_dataloader: DataLoader,
+    build_val_dataloader: Callable,
     limit_val_iters: int = 0,
     global_step: int = 0,
 ):
     """
     NOTE: This function is written without consideration for distributed multi-GPU training.
     """
-
-    val_dataloader.collate_fn.reset_call_counter()
+    val_dataloader = build_val_dataloader()
+    val_dataloader = accelerator.prepare(val_dataloader)
+    # val_dataloader.collate_fn.reset_call_counter()
     total_mask_tokens = 0
     total_loss = 0.0
     model.eval()
@@ -414,7 +424,7 @@ def run_validation(
                             text += "\n"
                         decoded_text += text
 
-                    logs[f"val-text-{batch_index}"] = decoded_text
+                    logs[f"val-text-{batch_index:03d}"] = decoded_text
                 accelerator.log(logs, step=global_step)
 
     avg_loss = total_loss / total_mask_tokens
