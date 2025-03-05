@@ -170,6 +170,7 @@ class DataloaderIterator:
         return frac * iga / (frac * iga + (1 - frac) * mga)
 
     def get_dataloader(self, step):
+        torch.cuda.empty_cache()
         if step < self.max_seq_len_start_iter:
             self.accelerator.gradient_accumulation_steps = self.initial_seq_gradient_accumulation_steps
             return self.dataloader1
@@ -287,6 +288,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
             accelerator.save_state()
 
         if step % config.evaluation_iters == 0 or step == config.max_train_iters - 1:
+            torch.cuda.empty_cache()
             val_metrics = run_validation(
                 accelerator, model, criterion, val_dataloader, limit_val_iters=config.limit_val_iters, global_step=step
             )
@@ -334,19 +336,22 @@ def run_validation(
                 tokenizer = val_dataloader.collate_fn.tokenizer
                 decoded_batch = decode_batch(tokenizer, batch, logits, topk=3, with_prob=True)
                 logs = {}
-                for decoded in decoded_batch:
+                for batch_index, decoded in enumerate(decoded_batch):
                     decoded_text = ""
+                    max_key_length = max(len(k) for k in decoded.keys())
                     for i, (k, v) in enumerate(decoded.items()):
-                        tabs = "\t\t" if k == "text" else "\t"
-                        text = f"{k}{tabs}{v}"
+                        spaces = " " * (max_key_length - len(k))
+                        text = f"{k}: {spaces}{v}"
                         if i < len(decoded) - 1:
                             text += "\n"
                         decoded_text += text
-                    logs[f"val-text/{i}"] = decoded_text
+
+                    logs[f"val-text-{batch_index}"] = decoded_text
                 accelerator.log(logs, step=global_step)
 
     val_metrics = {}
     val_metrics["loss/val"] = avg_loss
+    torch.cuda.empty_cache()
     return val_metrics
 
 
