@@ -19,6 +19,7 @@ setup(
         "tabulate",
         "datasets",
         "transformers",
+        "accelerate",
     ],
     extras_require={
         "torch": [

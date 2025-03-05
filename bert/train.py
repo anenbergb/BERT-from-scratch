@@ -21,7 +21,7 @@ from safetensors.torch import load_model
 
 from bert.model import BertConfig, BertMLM
 from bert.data import load_pretraining_dataset, TrainingCollator, TrainingCollatorForTest
-from bert.utils import configure_optimizer, get_lr_scheduler, decode_batch, worker_init_fn, set_seeds
+from bert.utils import configure_optimizer, get_lr_scheduler, decode_batch
 
 
 @dataclass
@@ -36,9 +36,9 @@ class TrainingConfig:
     limit_val_iters: int = field(default=0)
     checkpoint_total_limit: int = field(default=3)
     checkpoint_iters: int = field(default=10000)
-    evaluation_iters: int = field(default=10000)  # how often to evaluate the model
+    evaluation_iters: int = field(default=100000)  # how often to evaluate the model
 
-    test_percent: float = field(default=0.1)
+    test_percent: float = field(default=0.05)
     seed: int = field(default=0)
     mixed_precision: str = field(default="bf16")  # no for float32
 
@@ -50,10 +50,10 @@ class TrainingConfig:
     initial_seq_len_train_batch_size: int = field(default=128)
     max_seq_len_train_batch_size: int = field(default=24)
 
-    val_batch_size: int = field(default=128)
+    val_batch_size: int = field(default=64)
     # reduce the number of samples in the dataset for debugging purposes
     dataset_sample_limit: int = field(default=0)  # 0 means no limit
-    num_workers: int = field(default=0)
+    num_workers: int = field(default=2)
 
     # Linear warmup + CosineAnnealingLR
     # 2e-4 for AdamW
@@ -114,6 +114,7 @@ def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=Tru
     def build_val_dataloader():
         random_generator = torch.Generator()
         random_generator.manual_seed(config.seed)
+        tokenizer_slow = BertTokenizer.from_pretrained("bert-base-uncased")
         test_loader = DataLoader(
             tokenized_dataset["test"],
             batch_size=config.val_batch_size,
@@ -316,7 +317,6 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         for _ in range(config.start_iter):
             lr_scheduler.step()
 
-    accelerator.print(f"Training from {config.start_iter} to {config.max_train_iters}")
     model.train()
     for step, batch in (
         progress_bar := tqdm(
@@ -350,6 +350,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         progress_bar.set_postfix(**logs)
 
         if step > 0 and (step % config.checkpoint_iters == 0 or step == config.max_train_iters - 1):
+            accelerator.project_configuration.iteration = step
             accelerator.save_state()
 
         if step > 0 and (step % config.evaluation_iters == 0 or step == config.max_train_iters - 1):
@@ -387,7 +388,8 @@ def run_validation(
     """
     val_dataloader = build_val_dataloader()
     val_dataloader = accelerator.prepare(val_dataloader)
-    # val_dataloader.collate_fn.reset_call_counter()
+    # becauase val_dataloader is rebuilt, we no longer need to
+    # call val_dataloader.collate_fn.reset_call_counter()
     total_mask_tokens = 0
     total_loss = 0.0
     model.eval()
@@ -480,7 +482,7 @@ This trainer is written without consideration for distributed multi-GPU training
     parser.add_argument(
         "--evaluation-iters",
         type=int,
-        default=10000,
+        default=100000,
         help="Frequency of evaluation in iterations",
     )
     parser.add_argument(

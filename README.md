@@ -182,3 +182,46 @@ Consider freezing lower layers and only fine-tuning the top layers or classifier
 Gradient accumulation reduces the effective number of iterations.
 If initial batch size is 128, then gradient accumulation = 2 is required
 If max batch size is 24, then 10x is required.
+
+## Evaluation Metrics
+
+### Perplexity
+
+Perplexity is the exponentiation of the average negative log-likelihood (NLL) of the correct (masked) tokens, calculated over a dataset.
+For a masked language model like BERT, it quantifies how "surprised" the model is when predicting the masked tokens — lower perplexity indicates better predictions, meaning the model assigns higher probabilities to the correct tokens.
+Mathematically, for a dataset with N masked tokens, perplexity (PPL) is defined as:
+$$
+PPL = \exp⁡(-\frac{1}{N}\sum_{i=1}^{N}\log⁡P(w_i∣w_{context}))
+$$
+
+Where:
+* $w_i$: The i-th masked token (the ground truth).
+* $w_{context}$: The surrounding context (unmasked tokens) used to predict $w_i$.
+* $P(w_i∣w_{context})$: The model’s predicted probability of the correct token $w_i$ given the context.
+* N: The total number of masked tokens in the evaluation dataset.
+
+
+BERT is trained with a masked language modeling objective, where some tokens in a sentence are replaced with [MASK], and the model predicts the original tokens based on the bidirectional context.
+
+Perplexity evaluates this task:
+
+1. Input Preparation:
+* A sentence is tokenized, and a fraction of tokens (e.g., 15% in BERT’s pretraining) are masked.
+* Example: "The cat sat on the [MASK]." → Predict "mat".
+
+2. Model Prediction:
+* BERT outputs a probability distribution over its vocabulary for each [MASK] position.
+* For the correct token (e.g., "mat"), the model assigns a probability P("mat"∣"The cat sat on the [MASK]").
+
+3. Loss Calculation:
+* The negative log-likelihood is computed: $−\log⁡P(\text{"mat"}∣\text{context})$
+* This measures how confident the model is—low NLL means high probability for the correct token.
+
+4. Perplexity:
+* Average the NLL across all masked tokens in the dataset, then exponentiate to get perplexity.
+* Example: If the average NLL is 2.3, then $PPL=e^{2.3} \approx 10$, meaning the model is effectively "choosing" between 10 equally likely options on average.
+
+
+Low Perplexity: The model predicts masked tokens with high confidence (e.g., PPL=2 means it’s like choosing between 2 options).
+
+High Perplexity: The model is uncertain, assigning low probabilities to the correct tokens (e.g., PPL=100 means it’s like choosing among 100 options).

@@ -123,8 +123,7 @@ class BertEmbeddings(nn.Module):
         x = word_emb + tok_type_emb
 
         if self.position_embedding_type == "absolute":
-            position_emb = self.position_embeddings(position_ids)
-            x += position_emb
+            x = x + self.position_embeddings(position_ids)
 
         # LayerNorm stabilizes the combined embeddings by ensuring zero mean and unit variance
         if not self.pre_layer_norm:
@@ -293,12 +292,12 @@ class BertBlock(nn.Module):
             torch.Tensor: Output tensor after applying attention and feed-forward layers.
         """
         if self.pre_layer_norm:
-            x += self.attention(self.ln1(x), attention_mask)
+            x = x + self.attention(self.ln1(x), attention_mask)
         else:
             x = self.ln1(x + self.attention(x, attention_mask))
 
         if self.pre_layer_norm:
-            x += self.ffn(self.ln2(x))
+            x = x + self.ffn(self.ln2(x))
         else:
             x = self.ln2(x + self.ffn(x))
         return x
