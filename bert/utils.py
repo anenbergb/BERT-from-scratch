@@ -44,3 +44,54 @@ def get_lr_scheduler(optimizer, lr_warmup_iters, max_train_iters):
             return max(0.0, 1.0 - decay_step / total_decay_steps)
 
     return torch.optim.lr_scheduler.LambdaLR(optimizer, schedule)
+
+
+def decode_with_mask(tokenizer, input_ids):
+    tokens = tokenizer.convert_ids_to_tokens(input_ids)
+    special_tokens = [x for x in tokenizer.all_special_tokens if x != tokenizer.mask_token]
+    filtered_tokens = [x for x in tokens if x not in special_tokens]
+    text = tokenizer.convert_tokens_to_string(filtered_tokens)
+    clean_text = tokenizer.clean_up_tokenization(text)
+    return clean_text
+
+
+def decode_pred_string(tokenizer, input_ids, mask_token_index, topk_tokens, k=0, with_prob=True):
+    pred_tokens = tokenizer.convert_ids_to_tokens(input_ids)
+    for i, token_index in enumerate(mask_token_index.tolist()):
+        pred_token_id = topk_tokens.indices[i][k].item()
+        pred_token = tokenizer.convert_ids_to_tokens(pred_token_id)
+        if with_prob:
+            pred_prob = topk_tokens.values[i][k].item()
+            pred_token = f"{pred_token}[{pred_prob:.1%}]"
+        pred_tokens[token_index] = pred_token
+    filtered_pred_tokens = [x for x in pred_tokens if x not in tokenizer.all_special_tokens]
+    text = tokenizer.convert_tokens_to_string(filtered_pred_tokens)
+    clean_text = tokenizer.clean_up_tokenization(text)
+    return clean_text
+
+
+def decode_batch(tokenizer, batch, token_logits, topk=2, with_prob=True):
+    output = []
+    batch_original_text = tokenizer.batch_decode(batch["original_input_ids"], skip_special_tokens=True)
+    for batch_index in range(token_logits.size(0)):
+        input_ids = batch["input_ids"][batch_index]
+        # only decode those samples that have a mask token
+        if torch.count_nonzero(input_ids == tokenizer.mask_token_id).item() == 0:
+            continue
+
+        decoded = {
+            "text": batch_original_text[batch_index],
+            "text_with_mask": decode_with_mask(tokenizer, input_ids),
+        }
+
+        mask_token_index = torch.where(input_ids == tokenizer.mask_token_id)[0]
+        mask_token_logits = token_logits[batch_index, mask_token_index, :]
+        mask_token_probs = torch.softmax(mask_token_logits, dim=1)
+        topk_tokens = torch.topk(mask_token_probs, topk, dim=1)
+
+        for k in range(topk):
+            decoded[f"pred_top_{k+1}"] = decode_pred_string(
+                tokenizer, input_ids, mask_token_index, topk_tokens, k, with_prob
+            )
+        output.append(decoded)
+    return output
