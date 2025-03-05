@@ -34,8 +34,8 @@ class TrainingConfig:
     max_train_iters: int = field(default=1000000)
     limit_val_iters: int = field(default=0)
     checkpoint_total_limit: int = field(default=3)
-    checkpoint_iters: int = field(default=5000)
-    evaluation_iters: int = field(default=5000)  # how often to evaluate the model
+    checkpoint_iters: int = field(default=10000)
+    evaluation_iters: int = field(default=10000)  # how often to evaluate the model
 
     test_percent: float = field(default=0.1)
     seed: int = field(default=0)
@@ -74,6 +74,7 @@ class TrainingConfig:
     max_sequence_length: int = field(default=512)
 
     initial_seq_len_training_fraction: float = field(default=0.9)
+    train_only_with_initial_seq_len: bool = field(default=False)
 
 
 def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=True) -> DataLoader:
@@ -223,18 +224,23 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     tokenizer = BertTokenizerFast.from_pretrained("bert-base-uncased")
     assert tokenizer.vocab_size == bert_config.vocab_size
 
-    initial_train_dataloader, _ = load_tokenized_dataloader(config, select_initial_seq_len=True)
-    max_train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
+    if config.train_only_with_initial_seq_len:
+        train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=True)
+        train_dataloader, val_dataloader = accelerator.prepare(train_dataloader, val_dataloader)
+    else:
+        initial_train_dataloader, _ = load_tokenized_dataloader(config, select_initial_seq_len=True)
+        max_train_dataloader, val_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
+        initial_train_dataloader, max_train_dataloader, val_dataloader = accelerator.prepare(
+            initial_train_dataloader, max_train_dataloader, val_dataloader
+        )
+        train_dataloader = DataloaderIterator(initial_train_dataloader, max_train_dataloader, accelerator, config)
+
     model = BertMLM(bert_config)
     criterion = nn.CrossEntropyLoss()  # ignore_index = -100
     optimizer = configure_optimizer(model, config.weight_decay, config.lr)
     lr_scheduler = get_lr_scheduler(optimizer, config.lr_warmup_iters, config.max_train_iters)
 
-    model, optimizer, criterion, lr_scheduler, initial_train_dataloader, max_train_dataloader, val_dataloader = (
-        accelerator.prepare(
-            model, optimizer, criterion, lr_scheduler, initial_train_dataloader, max_train_dataloader, val_dataloader
-        )
-    )
+    model, optimizer, criterion, lr_scheduler = accelerator.prepare(model, optimizer, criterion, lr_scheduler)
 
     # TODO fix model saving names?
     # ONLY load the model weights from the checkpoint. Leave the optimizer and scheduler as is.
@@ -258,11 +264,10 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         for _ in range(config.start_iter):
             lr_scheduler.step()
 
-    dataloader_iter = DataloaderIterator(initial_train_dataloader, max_train_dataloader, accelerator, config)
     for step, batch in (
         progress_bar := tqdm(
-            enumerate(dataloader_iter, start=config.start_iter),
-            total=len(dataloader_iter),
+            enumerate(train_dataloader, start=config.start_iter),
+            total=len(train_dataloader),
             disable=not accelerator.is_local_main_process,
             desc="Training",
         )
@@ -284,10 +289,10 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         accelerator.log(logs, step=step)
         progress_bar.set_postfix(**logs)
 
-        if step % config.checkpoint_iters == 0 or step == config.max_train_iters - 1:
+        if step > 0 and (step % config.checkpoint_iters == 0 or step == config.max_train_iters - 1):
             accelerator.save_state()
 
-        if step % config.evaluation_iters == 0 or step == config.max_train_iters - 1:
+        if step > 0 and (step % config.evaluation_iters == 0 or step == config.max_train_iters - 1):
             torch.cuda.empty_cache()
             val_metrics = run_validation(
                 accelerator, model, criterion, val_dataloader, limit_val_iters=config.limit_val_iters, global_step=step
@@ -397,7 +402,7 @@ This trainer is written without consideration for distributed multi-GPU training
     parser.add_argument(
         "--evaluation-iters",
         type=int,
-        default=5000,
+        default=10000,
         help="Frequency of evaluation in iterations",
     )
     parser.add_argument(
@@ -429,6 +434,14 @@ This trainer is written without consideration for distributed multi-GPU training
         default=0,
         help="Limit the number of samples in the dataset for debugging purposes",
     )
+    parser.add_argument(
+        "--train-only-with-initial-seq-len",
+        action="store_true",
+        help="Train only with the initial sequence length of 128. "
+        "This will reduce the context window to 128 tokens for the entire training, "
+        "resulting in a model that cannot handle long context windos of 512 tokens. "
+        "This will significantly speed up training as compared to the training with the full 512 token context window.",
+    )
     return parser.parse_args()
 
 
@@ -450,6 +463,9 @@ if __name__ == "__main__":
         max_seq_len_dataset_cache_path=args.max_dataset_cache_path,
         dataset_sample_limit=args.debug_dataset_sample_limit,
         lr=args.lr,
+        train_only_with_initial_seq_len=args.train_only_with_initial_seq_len,
     )
     bert_config = BertConfig(pre_layer_norm=args.pre_layer_norm)
+    if args.train_only_with_initial_seq_len:
+        bert_config.max_position_embeddings = config.initial_sequence_length
     sys.exit(train_mlm(config, bert_config))
