@@ -14,7 +14,7 @@ from transformers import BertTokenizer, BertTokenizerFast
 
 # Huggingface
 from accelerate import Accelerator
-from accelerate.utils import ProjectConfiguration, GradientAccumulationPlugin
+from accelerate.utils import ProjectConfiguration
 from safetensors.torch import load_model
 
 
@@ -37,6 +37,7 @@ class TrainingConfig:
     checkpoint_iters: int = field(default=5000)
     evaluation_iters: int = field(default=5000)  # how often to evaluate the model
 
+    test_percent: float = field(default=0.1)
     seed: int = field(default=0)
     mixed_precision: str = field(default="bf16")  # no for float32
 
@@ -94,6 +95,8 @@ def load_tokenized_dataloader(config: TrainingConfig, select_initial_seq_len=Tru
         dataset_cache_path=dataset_cache_path,
         token_sequence_length=sequence_length,
         sample_limit=config.dataset_sample_limit,
+        test_percent=config.test_percent,
+        random_seed=config.seed,
     )
     logger.info(f"Tokenized dataset\n{tokenized_dataset}")
     return DataLoader(
@@ -212,7 +215,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
     initial_train_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=True)
     max_train_dataloader = load_tokenized_dataloader(config, select_initial_seq_len=False)
     model = BertMLM(bert_config)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss()  # ignore_index = -100
     optimizer = configure_optimizer(model, config.weight_decay, config.lr)
     lr_scheduler = get_lr_scheduler(optimizer, config.lr_warmup_iters, config.max_train_iters)
 
@@ -220,6 +223,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         model, optimizer, initial_train_dataloader, max_train_dataloader, criterion, lr_scheduler
     )
 
+    # TODO fix model saving names?
     # ONLY load the model weights from the checkpoint. Leave the optimizer and scheduler as is.
     if config.resume_from_checkpoint is not None and os.path.exists(config.resume_from_checkpoint):
         model_fpath = os.path.join(config.resume_from_checkpoint, "model.safetensors")
@@ -263,10 +267,7 @@ def train_mlm(config: TrainingConfig, bert_config: BertConfig) -> int:
         lr_scheduler.step()
         optimizer.zero_grad()
         current_lr = lr_scheduler.get_last_lr()[0]
-        logs = {
-            "loss/train": loss.detach().item(),
-            "lr": current_lr,
-        }
+        logs = {"loss/train": loss.detach().item(), "lr": current_lr, "sequence_length": batch["labels"].size(1)}
         accelerator.log(logs, step=step)
         progress_bar.set_postfix(**logs)
 
