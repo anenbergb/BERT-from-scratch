@@ -236,7 +236,7 @@ class BertFFN(nn.Module):
             nn.Linear(config.hidden_size, config.hidden_size * self.scale_factor),
             # approximate GELU with tanh is sufficient for BERT
             nn.GELU(approximate="tanh"),
-            nn.Dropout(config.hidden_dropout_prob),
+            nn.Dropout(config.hidden_dropout_prob), # technically, this isn't standard for BERT
             nn.Linear(config.hidden_size * self.scale_factor, config.hidden_size),
             nn.Dropout(config.hidden_dropout_prob),
         )

@@ -65,7 +65,7 @@ This script will save the tokenized dataset to disk.
     parser.add_argument(
         "--test-percent",
         type=float,
-        default=0.1,
+        default=0.05,
         help="Percentage of the dataset to use for testing.",
     )
     parser.add_argument(
