@@ -204,6 +204,8 @@ Weight Decay: 0.01.
 Loss: Masked Language Model (MLM) + Next Sentence Prediction (NSP), with 15% of tokens masked for MLM.
 ```
 
+I selected to train the BERT model using Pre-LayerNormalization, where the layer norm is applied to the input of each self-attention 
+and feed forward block rather than to the output after the residual connection.
 The BERT model trained above actually used the "Pre-LayerNormalization" approach described in described in ["On Layer Normalization in the Transformer Architecture" by Xiong et al. (2020)](https://arxiv.org/abs/2002.04745). The Layer Norm is applied to the input of each self-attention and feed forward block rather than to the output after the residual connection.
 Pre-LayerNormalization allows for the use of a greater learning rate learning rate from 3e-4 (rather than 1e-4), and reduces the necessity for a warm-up stage.
 According to the authors of the paper using such a high learning rate for the standard post-LN BERT would lead to optimization divergence.
