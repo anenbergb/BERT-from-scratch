@@ -1,9 +1,39 @@
 # BERT-from-scratch
-Implementation of BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding
+Implements "Masked Language Model" pre-training for [BERT: Pre-training of Deep Bidirectional Transformers for Language Understanding](https://arxiv.org/abs/1810.04805)
+
+## 1M Iteration Training Results
+I successfully pre-trained BERT-base model for 1M iterations using the randomized whole word masking procedure.
+
+The BERT-base trained on 128 token length sequences achieved the following loss and perplexity.
+|            | Train | Test  |
+|------------|-------|-------|
+| Loss       | 2.065 | 2.391 |
+| Perplexity | 7.883 | 10.93 |
+
+<img src="https://github.com/user-attachments/assets/cbd2b5b8-6c38-49a0-8019-e847362721d1" width="500"/>
+
+10k step linear warm-up and linear decay for the subsequent 990k iterations was used.
+
+<img src="https://github.com/user-attachments/assets/743d3dab-24f0-4b49-86ed-e563636f2c7e" width="300"/>
+
+### Example Masked Token Predictions
+5% of the dataset is reserved for the validation set. Validation is performed every 100k iterations during training.
+Sequences and masked predictions are randomly sampled from the validation set and logged to tensorboard such that the
+model performance can be qualitatively accessed.
+
+<img src="https://github.com/user-attachments/assets/de5c724e-8e36-47ad-afaf-ba748076dbf0" width="700"/>
 
 
+Some example results are displayed below
+```
+text:           neurensin - 2 is a protein that in humans is encoded by the nrsn2 gene. references further reading
+text_with_mask: neurensin - 2 [MASK] a protein [MASK] [MASK] humans is encoded [MASK] [MASK] nrsn2 gene. references [MASK] reading
+pred_top_1:     neurensin - 2 is[98.9%] a protein that[97.6%] in[98.6%] humans is encoded by[100.0%] the[99.8%] nrsn2 gene. references further[100.0%] reading
+pred_top_2:     neurensin - 2,[1.0%] a protein which[1.9%] to[1.0%] humans is encoded as[0.0%] an[0.1%] nrsn2 gene. references related[0.0%] reading
+pred_top_3:     neurensin - 2 -[0.1%] a protein found[0.2%] on[0.1%] humans is encoded in[0.0%] a[0.0%] nrsn2 gene. references additional[0.0%] reading
+```
 
-Tokenizer
+## Tokenizer
 * https://github.com/google/sentencepiece
 
 
@@ -99,6 +129,15 @@ Input Formatting
 
 # Masking
 * Whole word masking is preferred to masking individual WordPiece tokens https://github.com/google-research/bert/blob/master/README.md
+
+## Whole Word Masking procedure
+ The training data generator
+chooses 15% of the token positions at random for
+prediction. If the i-th token is chosen, we replace
+the i-th token with (1) the [MASK] token 80% of
+the time (2) a random token 10% of the time (3)
+the unchanged i-th token 10% of the time. T
+
 
 # Training hyperparameters
 
