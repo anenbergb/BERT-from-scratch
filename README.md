@@ -93,9 +93,13 @@ I counted a total of 4.01B words across both datasets, which is greater than the
 
 BERT uses WordPiece, a subword tokenization method, as its tokenizer.
 This approach strikes a balance between word-level and character-level tokenization, allowing BERT to efficiently handle a wide vocabulary while managing rare or out-of-vocabulary words.
-Details of WordPiece in BERT:
-* How It Works: WordPiece breaks down text into smaller units (subwords or word pieces) based on a pre-trained vocabulary. It starts with individual characters and iteratively merges them into larger tokens (e.g., "playing" might be split into "play" and "##ing"), guided by a likelihood-based algorithm that maximizes the probability of the training corpus.
+
+### Details of WordPiece in BERT:
+* How It Works: WordPiece breaks down text into smaller units (subwords or word pieces) based on a pre-trained vocabulary.
+It starts with individual characters and iteratively merges them into larger tokens (e.g., "playing" might be split into "play" and "##ing"),
+guided by a likelihood-based algorithm that maximizes the probability of the training corpus. The tokenizer is trained on the same dataset as BERT (BooksCorpus and English Wikipedia), ensuring it reflects the statistical properties of the pre-training corpus.
 * Vocabulary Size: BERT’s WordPiece tokenizer has a vocabulary of 30,000 tokens, which includes whole words, subwords, and special tokens like [CLS] (for classification) and [SEP] (to separate sentences).
+However, the Huggingface's BERT WordPiece tokenizer has vocabulary size of 30,522.
 * Special Tokens: 
 ```
 [CLS]: Added at the beginning of every input sequence for classification tasks.
@@ -104,63 +108,81 @@ Details of WordPiece in BERT:
 [MASK]: Used during pre-training for the Masked Language Modeling task.
 ##: A prefix for subword pieces that attach to a previous token (e.g., "playing" → "play" + "##ing").
 ```
-Training: The WordPiece vocabulary was trained on the same datasets as BERT (BooksCorpus and English Wikipedia), ensuring it reflects the statistical properties of the pre-training corpus.
 
-Why WordPiece?
+The algorithm used to score which subword pairs to merge is given by
+
+$$score = \frac{\text{freq-of-pair}}{\text{freq-of-first-element}  \times  \text{freq-of-second-element}}$$
+
+By dividing the frequency of the pair by the product of the frequencies of each of its parts,
+the algorithm prioritizes the merging of pairs where the individual parts are less frequent in the vocabulary.
+
+### Why WordPiece?
 * Efficiency: It reduces the vocabulary size compared to full-word tokenization, making it computationally manageable.
 * Flexibility: It can handle unseen words by breaking them into known subwords (e.g., "unhappiness" → "un" + "##happi" + "##ness").
 * Bidirectionality: It pairs well with BERT’s bidirectional architecture, as it preserves meaningful chunks of text for contextual understanding.
 
+### Byte Pair Encoding as an alternative tokenizer to WordPiece
+* Byte Pair Encoding (BPE) is a similar tokenization algorithm to WordPiece, and is used in models such as GPT and BART.
+* The vocabulary training algorithm for BPE is very similar to WordPiece in that from a set of individual characters,
+the vocabulary is constructed by iteratively merging pairs of subword units. However, the subword pairs are merged according
+to the frequency at which they appear in the training corpus. Subword pairs that most commonly appear next to eachother are merged first.
+* The BPE vocabulary can be constructed from the ASCII and Unicode characters, or from the byte-level representations.
 
-Tokenizer web app
-* https://tiktokenizer.vercel.app/
-
-
-Byte Pair Encoding
-- https://huggingface.co/learn/nlp-course/en/chapter6/5
-- Get the unique set of words in the corpus
-- Build the vocabulary by taking all the symbols to write those words. e.g. all the ASCII and Unicode characters
-- Add new tokens to the vocabulary by merging 2 items in the vocabulary. The pair of tokens to merge is determined by identifying the pair of tokens that most commonly occur next to eachother.  
-
-WordPiece tokenizer
-* https://huggingface.co/learn/nlp-course/en/chapter6/6?fw=pt
-* https://huggingface.co/learn/nlp-course/en/chapter6/8?fw=pt
-
-
-Cased vs. Uncased
+### Cased vs. Uncased
+This implementation of BERT uses the uncased tokenizer.
 * Uncased means that the text has been lowercased before WordPiece tokenization, e.g., John Smith becomes john smith. The Uncased model also strips out any accent markers.
-* Cased means that the true case and accent markers are preserved. Typically, the Uncased model is better unless you know that case information is important for your task (e.g., Named Entity Recognition or Part-of-Speech tagging).
+* Cased means that the true case and accent markers are preserved.
 
-Tokenization steps
+Typically, the Uncased model is better unless you know that case information is important for your task (e.g., Named Entity Recognition or Part-of-Speech tagging).
+
+### Tokenization steps
 1. Normalization (any cleanup of the text that is deemed necessary, such as removing spaces or accents, Unicode normalization, etc.)
 2. Pre-tokenization (splitting the input into words)
 3. Running the input through the model (using the pre-tokenized words to produce a sequence of tokens)
 4. Post-processing (adding the special tokens of the tokenizer, generating the attention mask and token type IDs)
 
-## Huggingface Tokenizer
+### Training the Tokenizer
+I experimented with training the tokenizer from scratch [see 'train_tokenizer.py'](bert/train_tokenizer.py),
+but ultimately just used the pre-trained Huggingface tokenizers for BERT.
+
+### Huggingface Tokenizer
+
 [BertTokenizer](https://huggingface.co/docs/transformers/en/model_doc/bert#transformers.BertTokenizer)
-* BERT tokenizer baed on WordPiece
-* github implementation https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/bert/tokenization_bert.py
+* BERT tokenizer based on WordPiece
+* [github implementation](https://github.com/huggingface/transformers/blob/v4.49.0/src/transformers/models/bert/tokenization_bert.py)
 [BertTokenizerFast](https://huggingface.co/docs/transformers/en/model_doc/bert#transformers.BertTokenizerFast)
 * "fast" BERT tokenizer based on WordPiece
 
-Input Formatting
-* padding is required to make the input tensors have rectangular shape
-* attention masks {0,1} - indicate the tokens that should be attended to or ignored by the attention layers of the model.
-* most models can only handle sequences of 512 to 1024 tokens
+## Dataset Tokenization and Fixed Sequence Length
+BERT requires data input minibatches of fixed sequence length. In the paper, the authors report that the BERT model is
+pre-trained first on sequences of length 128 for 90% of the steps, and then on sequence of length 512 for the
+remaining 10% of the steps.
+A shorter length input sequence limits the range of tokens that the Transformer can attend to when predicting a masked token.
 
+I experimented with the suggested training procedure, but quickly realized that training on 512-length sequences
+required considerably more GPU vRAM and iterations to complete a training epoch due to the reduced minibatch size.
+Therefore, I selected pre-train the BERT model only on 128-length sequences for the 1M iteration training experiment described above.
 
-# Masking
-* Whole word masking is preferred to masking individual WordPiece tokens https://github.com/google-research/bert/blob/master/README.md
+### Mini-batch construction
+To construct a dataset minibatch, each variable length text sequence in the training corpus must be truncated to fixed token length (128)
+and then padded with the `[PAD]` token.
+A attention mask {0,1} is prepared to mark the tokens that shoudl be attended to or ignored by the attention layers of the model.
+The `[PAD]` tokens should be ignored.
 
 ## Whole Word Masking procedure
- The training data generator
-chooses 15% of the token positions at random for
-prediction. If the i-th token is chosen, we replace
-the i-th token with (1) the [MASK] token 80% of
-the time (2) a random token 10% of the time (3)
-the unchanged i-th token 10% of the time. T
+The BERT Masked Language Model pre-training procedure calls for 15% of the tokens in the input sequence to be randomly masked.
+However, of those selected tokens, 80% ared replaced with a [MASK] token, 10% are replaced with a random token, and the
+remaining 10% are left unchanged.
 
+I follow the example from [the official BERT implementation](https://github.com/google-research/bert/blob/master/README.md) and apply Whole Word Masking, where we always mask _all_
+of the tokens correstponding ot a word at once.
+
+In the following example, the Whole Word Masking procedure ensures that the word 'philammon' is masked in it's entirety.
+```
+Input Text:              the man jumped up , put his basket on phil ##am ##mon ' s head
+Original Masked Input:   [MASK] man [MASK] up , put his [MASK] on phil [MASK] ##mon ' s head
+Whole Word Masked Input: the man [MASK] up , put his basket on [MASK] [MASK] [MASK] ' s head
+```
 
 # Training hyperparameters
 
@@ -181,11 +203,14 @@ Dropout: 0.1 on all layers.
 Weight Decay: 0.01.
 Loss: Masked Language Model (MLM) + Next Sentence Prediction (NSP), with 15% of tokens masked for MLM.
 ```
-* could try reducing max steps to 100k
 
-As described in "On Layer Normalization in the Transformer Architecture" by Xiong et al. (2020), available at https://arxiv.org/abs/2002.04745, it isn't necessary to use the warm-up stage if Pre-LayerNormalization is applied. Just linearly decay the learning rate from 3e-4 (rather than 1e-4). Using such a high learning rate for post-LN BERT would lead to optimization divergence.
+The BERT model trained above actually used the "Pre-LayerNormalization" approach described in described in ["On Layer Normalization in the Transformer Architecture" by Xiong et al. (2020)](https://arxiv.org/abs/2002.04745). The Layer Norm is applied to the input of each self-attention and feed forward block rather than to the output after the residual connection.
+Pre-LayerNormalization allows for the use of a greater learning rate learning rate from 3e-4 (rather than 1e-4), and reduces the necessity for a warm-up stage.
+According to the authors of the paper using such a high learning rate for the standard post-LN BERT would lead to optimization divergence.
 
-
+Due to GPU vRAM limitations, I trained with a mini-batch size of 128. I used 2x gradient accumulation to achieve an effective batch size of 256,
+which matches the batch size used to pre-train the official BERT model. It's worth noting that using 2x gradient accumulation effectively halfed
+the number of gradient updates experienced at training time. The correct resolution to this would be to double the training period.
 
 ## Fine-Tuning
 ```
@@ -236,14 +261,6 @@ Small Datasets (<10k Samples):
 Learning Rate: Lower to 1e-5 or 2e-5 to avoid overfitting.
 Epochs: 2–3 (use early stopping).
 Consider freezing lower layers and only fine-tuning the top layers or classifier head.
-```
-
-* gradient accumulation shoudl be used to achieve larger effective batch size
-* early stopping may be performed to halt training if performance plateaus
-
-Gradient accumulation reduces the effective number of iterations.
-If initial batch size is 128, then gradient accumulation = 2 is required
-If max batch size is 24, then 10x is required.
 
 ## Evaluation Metrics
 
@@ -289,17 +306,11 @@ Low Perplexity: The model predicts masked tokens with high confidence (e.g., PPL
 High Perplexity: The model is uncertain, assigning low probabilities to the correct tokens (e.g., PPL=100 means it’s like choosing among 100 options).
 
 
-
-
 # References
 * BERT paper https://arxiv.org/abs/1810.04805
 * Blog post https://jalammar.github.io/illustrated-bert/
 * Google Research BERT implementation https://github.com/google-research/bert
-
-
-* https://www.philschmid.de/pre-training-bert-habana
 * Huggingface BERT model https://huggingface.co/google-bert/bert-base-uncased
 * Huggingface https://huggingface.co/docs/transformers/model_doc/bert
 * Huggingface language model training examples https://github.com/huggingface/transformers/tree/main/examples/pytorch/language-modeling
-
-
+* Huggingface tokenization tutorial https://huggingface.co/learn/nlp-course/en/chapter6/1?fw=pt
